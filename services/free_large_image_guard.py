@@ -463,9 +463,103 @@ def sniff_image_size(data: bytes) -> tuple[int, int] | None:
             return _sniff_webp(data)
         if data.startswith(b"\xff\xd8"):
             return _sniff_jpeg(data)
+        if data.startswith(b"BM"):
+            return _sniff_bmp(data)
     except Exception:
         return None
     return None
+
+
+def _sniff_bmp(data: bytes) -> tuple[int, int] | None:
+    """BITMAPINFOHEADER and BITMAPCOREHEADER. Pillow decodes both."""
+    if len(data) < 18 or not data.startswith(b"BM"):
+        return None
+    dib = int.from_bytes(data[14:18], "little")
+    if dib == 12:
+        if len(data) < 22:
+            return None
+        width = int.from_bytes(data[18:20], "little")
+        height = int.from_bytes(data[20:22], "little")
+    elif dib >= 16 and len(data) >= 26:
+        width = abs(int.from_bytes(data[18:22], "little", signed=True))
+        height = abs(int.from_bytes(data[22:26], "little", signed=True))
+    else:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def classify_image_header(data: bytes) -> tuple[str, int | None]:
+    """Classify a header without decoding pixels.
+
+    ``small`` is only a complete known header at or under the 1K pixel boundary.
+    Truncated, malformed, and unrecognized headers are ``unknown``, never small.
+    ``incomplete`` means a recognized signature that still needs more bytes.
+    """
+    if not data:
+        return "unknown", None
+    dims = sniff_image_size(data[:SNIFF_LIMIT])
+    if dims is not None:
+        pixels = int(dims[0]) * int(dims[1])
+        if is_large_pixel_count(pixels):
+            return "large", pixels
+        return "small", pixels
+    if _header_incomplete(data):
+        return "incomplete", None
+    return "unknown", None
+
+
+def _header_incomplete(data: bytes) -> bool:
+    if len(data) >= SNIFF_LIMIT:
+        return False
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) < 24:
+        return True
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) < 10:
+        return True
+    if data.startswith(b"RIFF") and len(data) < 12:
+        return True
+    if data.startswith(b"BM") and len(data) < 26:
+        return True
+    if data.startswith(b"\xff\xd8"):
+        return True
+    if len(data) < 32:
+        return True
+    return False
+
+
+def header_needs_guard(data: bytes) -> bool:
+    """True unless the header is a complete known image at or under the 1K boundary."""
+    return classify_image_header(data[:SNIFF_LIMIT])[0] != "small"
+
+
+def guard_pixels_for_bytes(data: bytes) -> int | None:
+    """Permit size hint. ``None`` means this buffer is a proven small image."""
+    kind, pixels = classify_image_header(data[:SNIFF_LIMIT])
+    if kind == "small":
+        return None
+    if kind == "large" and pixels:
+        return pixels
+    return int(_guard.threshold) + 1
+
+
+def edit_input_guard_pixels(*groups: object) -> int | None:
+    """Pixels that force one edit-input permit, or ``None`` when every input is proven small."""
+    needed: int | None = None
+    for images in groups:
+        if not images:
+            continue
+        entries = images if isinstance(images, (list, tuple)) else [images]
+        for item in entries:
+            raw = item[0] if isinstance(item, tuple) and item else item
+            if not isinstance(raw, (bytes, bytearray)):
+                hint = int(_guard.threshold) + 1
+            else:
+                hint = guard_pixels_for_bytes(bytes(raw))
+            if hint is None:
+                continue
+            needed = hint if needed is None else max(needed, hint)
+    return needed
 
 
 def _sniff_webp(data: bytes) -> tuple[int, int] | None:
@@ -527,20 +621,24 @@ def _sniff_jpeg(data: bytes) -> tuple[int, int] | None:
 
 
 def image_bytes_are_large(data: bytes) -> bool:
-    dims = sniff_image_size(data[:SNIFF_LIMIT])
-    if dims is None:
-        return False
-    return is_large_pixel_count(dims[0] * dims[1])
+    """True for a known large header and for any header that is not proven small."""
+    return header_needs_guard(data)
 
 
 def image_inputs_are_large(images: object) -> bool:
-    """Header-only check of already buffered edit inputs. Does not decode them."""
+    """True when any buffered input must take a heavy permit before decode.
+
+    A complete known 1K header stays false. Unrecognized, truncated, and
+    malformed headers are true so they are not treated as small.
+    """
     if not images:
         return False
     entries = images if isinstance(images, (list, tuple)) else [images]
     for item in entries:
         raw = item[0] if isinstance(item, tuple) and item else item
-        if isinstance(raw, (bytes, bytearray)) and image_bytes_are_large(bytes(raw)):
+        if isinstance(raw, (bytes, bytearray)) and header_needs_guard(bytes(raw)):
+            return True
+        if not isinstance(raw, (bytes, bytearray)) and raw:
             return True
     return False
 
@@ -560,23 +658,39 @@ def max_input_pixels(images: object) -> int:
     return best
 
 
-def b64_sample_pixels(b64_text: str) -> int | None:
-    """Decode only a header-sized prefix of a base64 payload."""
+def _b64_prefix(b64_text: str) -> bytes | None:
     text = str(b64_text or "").strip()
     if text.startswith("data:") and "," in text:
         text = text.split(",", 1)[1]
     sample = text[: ((SNIFF_LIMIT + 2) // 3) * 4]
-    if len(sample) < 16:
+    if len(sample) < 8:
         return None
     pad = (-len(sample)) % 4
     try:
-        data = base64.b64decode(sample + ("=" * pad), validate=False)
+        return base64.b64decode(sample + ("=" * pad), validate=False)
     except Exception:
+        return None
+
+
+def b64_sample_pixels(b64_text: str) -> int | None:
+    """Decode only a header-sized prefix of a base64 payload."""
+    data = _b64_prefix(b64_text)
+    if not data:
         return None
     dims = sniff_image_size(data)
     if dims is None:
         return None
     return int(dims[0]) * int(dims[1])
+
+
+def b64_guard_pixels(b64_text: str, declared_size: object = None) -> int | None:
+    """Permit hint before a full base64 decode. ``None`` only when proven small."""
+    if is_large_size(declared_size):
+        return pixel_count(declared_size) or int(_guard.threshold) + 1
+    data = _b64_prefix(b64_text)
+    if data is None:
+        return int(_guard.threshold) + 1
+    return guard_pixels_for_bytes(data)
 
 
 def _current_token() -> Token | None:
@@ -831,43 +945,24 @@ def read_stream_guarded(
         if not chunk:
             continue
         prefix.extend(chunk)
-        ready, dims = _sniff_ready(prefix)
-        if not ready:
-            if len(prefix) > SNIFF_LIMIT:
-                break
+        kind, pixels = classify_image_header(bytes(prefix))
+        if kind == "incomplete" and len(prefix) <= SNIFF_LIMIT:
             continue
-        large = _discovered_large(dims, content_length)
-        if large:
-            pixels = dims[0] * dims[1] if dims else _guard.threshold + 1
-            rest = [bytes(prefix)]
-            with heavy_image_work(discovered_pixels=pixels, stage=stage):
-                rest.extend(item for item in chunks if item)
-                return b"".join(rest)
-        break
+        if kind == "small":
+            break
+        # Known-large, truncated, malformed, or unrecognized. Never read the
+        # rest, or hand the bytes to a decoder, on the small-image path.
+        hint = pixels if kind == "large" and pixels else int(_guard.threshold) + 1
+        if content_length is not None and int(content_length) >= UNKNOWN_LARGE_BYTES:
+            hint = max(hint, int(_guard.threshold) + 1)
+        rest = [bytes(prefix)]
+        with heavy_image_work(discovered_pixels=hint, stage=stage):
+            rest.extend(item for item in chunks if item)
+            return b"".join(rest)
 
     parts = [bytes(prefix)]
     parts.extend(item for item in chunks if item)
     return b"".join(parts)
-
-
-def _sniff_ready(buf: bytes | bytearray) -> tuple[bool, tuple[int, int] | None]:
-    data = bytes(buf)
-    dims = sniff_image_size(data)
-    if dims is not None:
-        return True, dims
-    if data.startswith(b"\xff\xd8") and len(data) < SNIFF_LIMIT:
-        return False, None
-    if len(data) >= 32 or len(data) >= SNIFF_LIMIT:
-        return True, None
-    return False, None
-
-
-def _discovered_large(dims: tuple[int, int] | None, content_length: int | None) -> bool:
-    if dims is not None:
-        return is_large_pixel_count(dims[0] * dims[1])
-    if content_length is not None and int(content_length) >= UNKNOWN_LARGE_BYTES:
-        return True
-    return False
 
 
 def _join_chunks(chunks: Iterator[bytes]) -> bytes:

@@ -113,6 +113,19 @@ class ClassificationTests(GuardTestCase):
         sample = base64.b64encode(large).decode("ascii")
         self.assertGreater(guard.b64_sample_pixels(sample) or 0, LARGE_PIXEL_THRESHOLD)
         self.assertLess(guard.b64_sample_pixels(base64.b64encode(small).decode()) or 0, LARGE_PIXEL_THRESHOLD)
+        bmp_large = _bmp(3840, 2160)
+        bmp_small = _bmp(1024, 1024)
+        self.assertEqual(sniff_image_size(bmp_large), (3840, 2160))
+        self.assertEqual(sniff_image_size(bmp_small), (1024, 1024))
+        self.assertTrue(image_inputs_are_large([(bmp_large, "a.bmp", "image/bmp")]))
+        self.assertFalse(image_inputs_are_large([(bmp_small, "a.bmp", "image/bmp")]))
+        self.assertEqual(guard.classify_image_header(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)[0], "incomplete")
+        self.assertNotEqual(guard.classify_image_header(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)[0], "small")
+        self.assertEqual(guard.classify_image_header(b"????" * 16)[0], "unknown")
+        self.assertTrue(guard.header_needs_guard(b"????" * 16))
+        self.assertTrue(guard.header_needs_guard(b"BM" + b"\x00" * 8))
+        self.assertIsNotNone(guard.b64_guard_pixels(base64.b64encode(bmp_large).decode(), "1024x1024"))
+        self.assertIsNone(guard.b64_guard_pixels(base64.b64encode(small).decode(), "1024x1024"))
 
     def test_stream_acquires_before_the_rest_of_a_large_body(self) -> None:
         started = threading.Event()
@@ -1055,16 +1068,227 @@ class DiscoveredSizePipelineTests(GuardTestCase):
         self.assertTrue(all(item >= 1 for item in state["tail_active"]), state["tail_active"])
 
 
+def _bmp(width: int, height: int) -> bytes:
+    """BITMAPINFOHEADER only. Declares the size without a pixel buffer."""
+    dib = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 24, 0, 0, 0, 0, 0, 0)
+    header = b"BM" + struct.pack("<IHHI", 14 + len(dib), 0, 0, 14 + len(dib))
+    return header + dib
+
+
+class _FakeDecodedImage:
+    size = (8, 8)
+    mode = "RGBA"
+
+    def convert(self, _mode: str):
+        return self
+
+    def split(self):
+        return (self, self, self, self)
+
+    def resize(self, _size, _resample):
+        return self
+
+    def putalpha(self, _alpha) -> None:
+        return None
+
+    def save(self, buf, format: str = "PNG") -> None:  # noqa: A002
+        buf.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+
+class UnknownFormatEditTests(GuardTestCase):
+    """BMP is accepted by Pillow. An unrecognized header must not take the 1K path."""
+
+    def test_bmp_edit_pipeline_caps_six_threads_and_known_1k_does_not(self) -> None:
+        self._assert_edit_capped(_bmp(3840, 2160), "big.bmp", "image/bmp", capped=True)
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_active=5, max_waiting=10, wait_timeout_secs=2.0)
+        self._assert_edit_capped(_png(1024, 1024), "small.png", "image/png", capped=False)
+
+    def test_truncated_and_unknown_headers_are_guarded_before_decode(self) -> None:
+        truncated = b"\x89PNG\r\n\x1a\n" + b"\x00" * 4
+        unknown = b"not-an-image-header!!" + b"\x00" * 16
+        for payload, name in ((truncated, "trunc.png"), (unknown, "x.bin")):
+            with self.subTest(name=name):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(max_active=5, max_waiting=10, wait_timeout_secs=2.0)
+                seen = {"active": -1}
+
+                def open_image(_data, *args, **kwargs):
+                    seen["active"] = guard.stats()["active"]
+                    raise RuntimeError("malformed")
+
+                with mock.patch("services.protocol.openai_v1_image_edit.Image.open", open_image):
+                    with self.assertRaises(RuntimeError):
+                        self._call_edit(payload, name, "image/png")
+                self.assertGreaterEqual(seen["active"], 1)
+                self.assertEqual(guard.stats()["active"], 0)
+                self.assertEqual(guard.stats()["waiting"], 0)
+
+    def test_bmp_reference_download_and_materialize_hold_permit(self) -> None:
+        def chunks():
+            yield _bmp(3840, 2160)[:26]
+            self.assertGreaterEqual(guard.stats()["active"], 1)
+            yield b"tail"
+
+        data = guard.read_stream_guarded(chunks(), declared_size="1024x1024", stage="edit_reference_download")
+        self.assertTrue(data.startswith(b"BM"))
+        self.assertEqual(guard.stats()["active"], 0)
+
+        def small_chunks():
+            yield _png(1024, 1024)
+            self.assertEqual(guard.stats()["active"], 0)
+            yield b"rest"
+
+        guard.read_stream_guarded(small_chunks(), declared_size="1K", stage="edit_reference_download")
+        self.assertEqual(guard.stats()["peak_active"], 1)
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_active=5, max_waiting=10, wait_timeout_secs=2.0)
+        release = threading.Event()
+        lock = threading.Lock()
+        state = {"inside": 0, "peak": 0, "active": []}
+        errors: list[BaseException] = []
+
+        def save(_data, _base_url=None):
+            with lock:
+                state["inside"] += 1
+                state["peak"] = max(state["peak"], state["inside"])
+                state["active"].append(guard.stats()["active"])
+            release.wait(timeout=3)
+            with lock:
+                state["inside"] -= 1
+            return "http://example.test/out.png"
+
+        def worker() -> None:
+            try:
+                from services.protocol.conversation import ConversationRequest, _materialize_image_output
+
+                output = _materialize_image_output(
+                    _StreamingBackend(header=_bmp(3840, 2160)),
+                    ConversationRequest(
+                        model="gpt-image-2",
+                        prompt="p",
+                        size="1024x1024",
+                        response_format="b64_json",
+                    ),
+                    ["http://example.test/a.bmp"],
+                    1,
+                    1,
+                    "conv",
+                )
+                if output is None:
+                    errors.append(RuntimeError("missing bmp output"))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        try:
+            with mock.patch("services.protocol.conversation.save_image_bytes", save):
+                threads = [threading.Thread(target=worker, name=f"bmp-{i}") for i in range(6)]
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(ConcurrencyTests._wait_until(self, lambda: state["inside"] == 5 and guard.stats()["active"] == 5))
+                time.sleep(0.05)
+                self.assertEqual(state["peak"], 5)
+                release.set()
+                for thread in threads:
+                    thread.join(timeout=3)
+                    self.assertFalse(thread.is_alive())
+        finally:
+            release.set()
+        self.assertFalse(errors, errors)
+        self.assertEqual(state["peak"], 5)
+        self.assertEqual(guard.stats()["peak_active"], 5)
+        self.assertTrue(all(item >= 1 for item in state["active"]))
+        self.assertEqual(guard.stats()["active"], 0)
+
+    def _assert_edit_capped(self, image: bytes, name: str, mime: str, *, capped: bool) -> None:
+        release = threading.Event()
+        lock = threading.Lock()
+        state = {"inside": 0, "peak": 0, "active": []}
+        errors: list[BaseException] = []
+        local = threading.local()
+
+        def open_image(_data, *args, **kwargs):
+            if not getattr(local, "counted", False):
+                local.counted = True
+                with lock:
+                    state["inside"] += 1
+                    state["peak"] = max(state["peak"], state["inside"])
+                    state["active"].append(guard.stats()["active"])
+                release.wait(timeout=3)
+                with lock:
+                    state["inside"] -= 1
+            return _FakeDecodedImage()
+
+        def fake_pool(request):
+            from services.protocol.conversation import ImageOutput
+
+            return [ImageOutput(kind="result", model=request.model, index=1, total=1, data=[{"url": "u"}])]
+
+        def worker() -> None:
+            try:
+                self._call_edit(image, name, mime)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        try:
+            with mock.patch("services.protocol.openai_v1_image_edit.Image.open", open_image), \
+                    mock.patch("services.protocol.openai_v1_image_edit.stream_image_outputs_with_pool", fake_pool):
+                threads = [threading.Thread(target=worker, name=f"edit-{i}") for i in range(6)]
+                for thread in threads:
+                    thread.start()
+                if capped:
+                    self.assertTrue(
+                        ConcurrencyTests._wait_until(self, lambda: state["inside"] == 5 and guard.stats()["active"] == 5)
+                    )
+                    time.sleep(0.05)
+                    self.assertEqual(state["inside"], 5)
+                else:
+                    self.assertTrue(ConcurrencyTests._wait_until(self, lambda: state["inside"] == 6))
+                    self.assertEqual(guard.stats()["active"], 0)
+                    self.assertEqual(guard.stats()["peak_active"], 0)
+                release.set()
+                for thread in threads:
+                    thread.join(timeout=3)
+                    self.assertFalse(thread.is_alive())
+        finally:
+            release.set()
+        self.assertFalse(errors, errors)
+        if capped:
+            self.assertEqual(state["peak"], 5)
+            self.assertEqual(max(state["active"]), 5)
+            self.assertTrue(all(item >= 1 for item in state["active"]))
+            self.assertEqual(guard.stats()["peak_active"], 5)
+        else:
+            self.assertEqual(state["peak"], 6)
+            self.assertEqual(guard.stats()["peak_active"], 0)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertEqual(guard.stats()["waiting"], 0)
+
+    def _call_edit(self, image: bytes, name: str, mime: str):
+        from services.protocol.openai_v1_image_edit import handle
+
+        return handle({
+            "prompt": "edit",
+            "images": [(image, name, mime)],
+            "mask": [(_png(64, 64), "mask.png", "image/png")],
+            "model": "gpt-image-2",
+            "size": "1024x1024",
+            "n": 1,
+        })
+
+
 class _StreamingBackend:
     """Session shaped like the real client. ``download_image_bytes`` is the production method."""
 
-    def __init__(self, tail_active: list[int] | None = None) -> None:
+    def __init__(self, tail_active: list[int] | None = None, header: bytes | None = None) -> None:
         self.session = self
         self.tail_active = tail_active if tail_active is not None else []
+        self.header = header if header is not None else _png(3840, 2160)
 
     def get(self, url, timeout=120, stream=True):  # noqa: ARG002
         tail_active = self.tail_active
-        header = _png(3840, 2160)
+        header = self.header
 
         class _Response:
             status_code = 200

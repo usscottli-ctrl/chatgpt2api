@@ -301,12 +301,7 @@ def format_image_result(
     message: str = "",
     size: str | None = None,
 ) -> dict[str, Any]:
-    from services.free_large_image_guard import (
-        b64_sample_pixels,
-        heavy_image_work,
-        is_large_pixel_count,
-        is_large_size,
-    )
+    from services.free_large_image_guard import b64_guard_pixels, heavy_image_work
 
     data: list[dict[str, Any]] = []
     for item in items:
@@ -314,8 +309,7 @@ def format_image_result(
         if not b64_json:
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        sample_pixels = b64_sample_pixels(b64_json)
-        large = is_large_size(size) or is_large_pixel_count(sample_pixels)
+        guard_pixels = b64_guard_pixels(b64_json, size)
 
         def _one(payload: str = b64_json, revised: str = revised_prompt) -> dict[str, Any]:
             raw = base64.b64decode(payload)
@@ -329,12 +323,8 @@ def format_image_result(
             )
             return stored
 
-        if large:
-            with heavy_image_work(
-                declared_size=size,
-                discovered_pixels=sample_pixels,
-                stage="decode_upscale",
-            ):
+        if guard_pixels:
+            with heavy_image_work(discovered_pixels=guard_pixels, stage="decode_upscale"):
                 data.append(_one())
         else:
             data.append(_one())

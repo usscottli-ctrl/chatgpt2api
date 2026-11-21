@@ -52,11 +52,11 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
     images = body.get("images") or []
     masks = body.get("mask") or []
-    from services.free_large_image_guard import heavy_image_work, image_inputs_are_large, max_input_pixels
+    from services.free_large_image_guard import edit_input_guard_pixels, heavy_image_work
 
-    if image_inputs_are_large(images) or image_inputs_are_large(masks):
-        pixels = max(max_input_pixels(images), max_input_pixels(masks))
-        with heavy_image_work(discovered_pixels=pixels, stage="edit_input"):
+    guard_pixels = edit_input_guard_pixels(images, masks)
+    if guard_pixels:
+        with heavy_image_work(discovered_pixels=guard_pixels, stage="edit_input"):
             images = _composite_mask(images, masks)
             encoded_images = encode_images(images)
     else:
