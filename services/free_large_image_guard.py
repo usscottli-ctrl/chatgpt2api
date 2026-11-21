@@ -365,6 +365,9 @@ def reset_for_tests(*, enabled: bool = False) -> None:
     stack = getattr(_tls, "stack", None)
     if stack is not None:
         stack.clear()
+    pipelines = getattr(_tls, "pipelines", None)
+    if pipelines is not None:
+        pipelines.clear()
 
 
 def stats() -> dict[str, Any]:
@@ -658,6 +661,110 @@ def bind_large_image_job(size: object) -> Iterator[Token | None]:
         token.close()
 
 
+class _HeavyPipeline:
+    """One permit owned by the caller until every heavy phase on this thread ends.
+
+    A download may discover that the bytes are large after admission looked at
+    a small or missing ``size``. ``cover`` takes the permit at that moment.
+    Leaving the download helper must not drop it; only ``release`` does.
+    """
+
+    def __init__(self, declared_size: object, stage: str) -> None:
+        self.declared_size = declared_size
+        self.stage = stage
+        self.token: Token | None = None
+        self.owned = False
+        self.entered = False
+        self.discovered_pixels = 0
+
+    def cover(self, pixels: int | None = None, stage: str | None = None) -> None:
+        if not is_enabled():
+            return
+        if pixels:
+            self.discovered_pixels = max(self.discovered_pixels, int(pixels))
+        large = is_large_size(self.declared_size) or is_large_pixel_count(self.discovered_pixels)
+        if not large or self.entered:
+            return
+        if self.token is None:
+            current = _current_token()
+            if current is None or current.state not in {"queued", "reserved", "active"}:
+                current = _acquire_before_generation()
+                self.owned = True
+                _push_token(current)
+            self.token = current
+        if self.token.state != "active":
+            self.token.enter_heavy(stage or self.stage, _guard.wait_timeout_secs)
+            self.entered = True
+        else:
+            # Already inside this thread's heavy section. Do not take a second slot.
+            self.entered = False
+
+    def release(self) -> None:
+        token = self.token
+        try:
+            if self.entered and token is not None:
+                token.leave_heavy()
+        finally:
+            self.entered = False
+            if self.owned and token is not None:
+                _pop_token(token)
+                token.close()
+            self.owned = False
+            self.token = None
+
+
+def _current_pipeline() -> _HeavyPipeline | None:
+    stack = getattr(_tls, "pipelines", None)
+    if not stack:
+        return None
+    return stack[-1]
+
+
+def _push_pipeline(pipeline: _HeavyPipeline) -> None:
+    stack = getattr(_tls, "pipelines", None)
+    if stack is None:
+        stack = []
+        _tls.pipelines = stack
+    stack.append(pipeline)
+
+
+def _pop_pipeline(pipeline: _HeavyPipeline) -> None:
+    stack = getattr(_tls, "pipelines", None)
+    if not stack:
+        return
+    if stack[-1] is pipeline:
+        stack.pop()
+    elif pipeline in stack:
+        stack.remove(pipeline)
+
+
+@contextmanager
+def heavy_image_pipeline(
+    declared_size: object = None,
+    stage: str = "download_decode",
+) -> Iterator[_HeavyPipeline | None]:
+    """Keep one permit from the first large discovery through later heavy phases.
+
+    Declared 2K/4K takes the permit before the body. A 1K, ``auto``, or missing
+    size takes it when the download (or another phase) sees a large pixel
+    count, and that same permit still covers decode, upscale, and base64.
+    """
+    if not is_enabled():
+        yield None
+        return
+    pipeline = _HeavyPipeline(declared_size, stage)
+    _push_pipeline(pipeline)
+    try:
+        if is_large_size(declared_size):
+            pipeline.cover(pixel_count(declared_size), stage=stage)
+        yield pipeline
+    finally:
+        try:
+            pipeline.release()
+        finally:
+            _pop_pipeline(pipeline)
+
+
 @contextmanager
 def heavy_image_work(
     declared_size: object = None,
@@ -667,13 +774,21 @@ def heavy_image_work(
     """Hold one heavy-memory permit around the caller's allocation.
 
     Nested use on the same thread reuses the permit (no deadlock, no second
-    slot). The permit stays held if another thread asks to release it early.
+    slot). Inside ``heavy_image_pipeline`` a discovery extends that pipeline
+    instead of opening a permit that would be released when this block ends.
+    The permit stays held if another thread asks to release it early.
     """
     if not is_enabled():
         yield None
         return
     pixels = int(discovered_pixels or 0)
     large = is_large_size(declared_size) or is_large_pixel_count(pixels)
+    pipeline = _current_pipeline()
+    if pipeline is not None:
+        if large:
+            pipeline.cover(pixels or pixel_count(declared_size), stage=stage)
+        yield pipeline.token
+        return
     if not large:
         yield None
         return

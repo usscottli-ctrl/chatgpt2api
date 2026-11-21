@@ -352,17 +352,18 @@ def _materialize_image_output(
     total: int,
     conversation_id: str,
 ) -> ImageOutput | None:
-    """Download and store one result while a large-image permit is held.
+    """Download and store one result while one large-image permit is held.
 
-    The permit is taken before ``download_image_bytes`` when the requested
-    size is large. Unexpectedly large bodies are classified from header
-    bytes inside the download itself.
+    Declared 2K/4K takes the permit before the download. A 1K, auto, or
+    missing size still takes it when the body header is actually large, and
+    that permit stays held through decode, upscale, and base64. The download
+    helper must not release it when it returns.
     """
     if request.progress_callback:
         request.progress_callback("receiving_image")
-    from services.free_large_image_guard import heavy_image_work
+    from services.free_large_image_guard import heavy_image_pipeline
 
-    with heavy_image_work(declared_size=request.size, stage="download_decode"):
+    with heavy_image_pipeline(declared_size=request.size, stage="download_decode"):
         blobs = list(backend.download_image_bytes(image_urls, size=request.size))
         data: list[dict[str, Any]] = []
         for raw in blobs:

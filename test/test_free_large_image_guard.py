@@ -837,5 +837,257 @@ class IntegrationTests(GuardTestCase):
         self.assertFalse(section["cross_process"])
 
 
+class DiscoveredSizePipelineTests(GuardTestCase):
+    """Declared auto/1K must not drop the permit before upscale and base64.
+
+    The body is a real streamed download of a 3840x2160 header. Processing is
+    the real ``_materialize_image_output`` path, not a bare semaphore.
+    """
+
+    def test_small_or_missing_declaration_still_caps_actual_large_processing(self) -> None:
+        declared_sizes = (None, "auto", "", "1K", "1k", "1024x1024")
+        for declared in declared_sizes:
+            with self.subTest(declared=declared):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(max_active=5, max_waiting=10, wait_timeout_secs=2.0)
+                self._assert_processing_capped(declared)
+
+    def test_declared_2k_still_holds_across_processing(self) -> None:
+        self._assert_processing_capped("2K")
+        self._assert_processing_capped("2048x2048")
+
+    def test_processing_error_and_cancel_do_not_leak_or_duplicate(self) -> None:
+        from services.protocol.conversation import (
+            ConversationRequest,
+            ImageGenerationError,
+            _generate_single_image,
+            _materialize_image_output,
+        )
+
+        seen = {"active": -1}
+
+        def exploding_save(_data, _base_url=None):
+            seen["active"] = guard.stats()["active"]
+            raise RuntimeError("upscale failed")
+
+        backend = _StreamingBackend()
+        with mock.patch("services.protocol.conversation.save_image_bytes", exploding_save):
+            with self.assertRaises(RuntimeError):
+                _materialize_image_output(
+                    backend,
+                    ConversationRequest(model="gpt-image-2", prompt="p", size="1K", response_format="b64_json"),
+                    ["http://example.test/a.png"],
+                    1,
+                    1,
+                    "conv",
+                )
+        self.assertGreaterEqual(seen["active"], 1)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertEqual(guard.stats()["waiting"], 0)
+
+        calls = {"stream": 0}
+
+        def fake_stream(backend, request, index=1, total=1):
+            calls["stream"] += 1
+            return [
+                _materialize_image_output(
+                    _StreamingBackend(),
+                    request,
+                    ["http://example.test/a.png"],
+                    index,
+                    total,
+                    "conv",
+                )
+            ]
+
+        class FakeAPI:
+            def __init__(self, access_token: str = "", **_kwargs: object) -> None:
+                self.progress_callback = None
+
+            def close(self) -> None:
+                pass
+
+        with mock.patch("services.protocol.conversation.save_image_bytes", exploding_save), \
+                mock.patch("services.protocol.conversation.stream_image_outputs", fake_stream), \
+                mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeAPI), \
+                mock.patch("services.protocol.conversation.account_service.get_available_access_token", return_value="tok"), \
+                mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "a@example.test"}), \
+                mock.patch("services.protocol.conversation.account_service.mark_image_result", return_value=None):
+            with self.assertRaises(ImageGenerationError):
+                _generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="p", size="auto", n=1),
+                    1,
+                    1,
+                )
+        self.assertEqual(calls["stream"], 1)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertEqual(guard.stats()["waiting"], 0)
+
+        release = threading.Event()
+        entered = {"n": 0}
+        lock = threading.Lock()
+
+        def holding_save(_data, _base_url=None):
+            with lock:
+                entered["n"] += 1
+            release.wait(timeout=3)
+            return "http://example.test/out.png"
+
+        outcomes: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                _materialize_image_output(
+                    _StreamingBackend(),
+                    ConversationRequest(model="gpt-image-2", prompt="p", size=None, response_format="b64_json"),
+                    ["http://example.test/a.png"],
+                    1,
+                    1,
+                    "conv",
+                )
+            except BaseException as exc:  # noqa: BLE001
+                outcomes.append(exc)
+
+        with mock.patch("services.protocol.conversation.save_image_bytes", holding_save):
+            holders = [threading.Thread(target=worker, name=f"hold-{i}") for i in range(5)]
+            for thread in holders:
+                thread.start()
+            self.assertTrue(ConcurrencyTests._wait_until(self, lambda: entered["n"] == 5 and guard.stats()["active"] == 5))
+            queued = threading.Thread(target=worker, name="queued")
+            queued.start()
+            token_id = None
+            deadline = time.time() + 2
+            while time.time() < deadline and token_id is None:
+                for item in guard.token_snapshot():
+                    if item["state"] == "queued":
+                        token_id = item["id"]
+                        break
+                time.sleep(0.01)
+            self.assertIsNotNone(token_id)
+            self.assertEqual(entered["n"], 5)
+            self.assertTrue(guard.cancel_token(int(token_id)))
+            queued.join(timeout=2)
+            self.assertFalse(queued.is_alive())
+            self.assertEqual(entered["n"], 5)
+            release.set()
+            for thread in holders:
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], LargeImageAdmissionError)
+        self.assertEqual(outcomes[0].reason, "cancelled")
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertEqual(guard.stats()["waiting"], 0)
+
+    def _assert_processing_capped(self, declared: object) -> None:
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_active=5, max_waiting=10, wait_timeout_secs=2.0)
+        release = threading.Event()
+        lock = threading.Lock()
+        state = {"inside": 0, "peak": 0, "done": 0, "active_samples": [], "tail_active": []}
+        errors: list[BaseException] = []
+
+        def save(_data, _base_url=None):
+            with lock:
+                state["inside"] += 1
+                state["peak"] = max(state["peak"], state["inside"])
+                state["active_samples"].append(guard.stats()["active"])
+            release.wait(timeout=3)
+            with lock:
+                state["inside"] -= 1
+                state["done"] += 1
+            return "http://example.test/out.png"
+
+        def worker() -> None:
+            try:
+                from services.protocol.conversation import ConversationRequest, _materialize_image_output
+
+                output = _materialize_image_output(
+                    _StreamingBackend(state["tail_active"]),
+                    ConversationRequest(
+                        model="gpt-image-2",
+                        prompt="p",
+                        size=declared,  # type: ignore[arg-type]
+                        response_format="b64_json",
+                    ),
+                    ["http://example.test/a.png"],
+                    1,
+                    1,
+                    "conv",
+                )
+                if output is None or not output.data:
+                    errors.append(RuntimeError("missing image output"))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        try:
+            with mock.patch("services.protocol.conversation.save_image_bytes", save):
+                threads = [threading.Thread(target=worker, name=f"img-{index}") for index in range(6)]
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(
+                    ConcurrencyTests._wait_until(
+                        self,
+                        lambda: state["inside"] == 5 and guard.stats()["active"] == 5,
+                    ),
+                    guard.stats(),
+                )
+                time.sleep(0.05)
+                self.assertEqual(state["inside"], 5)
+                self.assertEqual(state["peak"], 5)
+                self.assertLessEqual(guard.stats()["peak_active"], 5)
+                release.set()
+                for thread in threads:
+                    thread.join(timeout=3)
+                    self.assertFalse(thread.is_alive())
+        finally:
+            release.set()
+        self.assertFalse(errors, errors)
+        self.assertEqual(state["done"], 6)
+        self.assertEqual(state["peak"], 5)
+        self.assertEqual(guard.stats()["peak_active"], 5)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertEqual(guard.stats()["waiting"], 0)
+        self.assertGreaterEqual(len(state["active_samples"]), 5)
+        self.assertTrue(all(item >= 1 for item in state["active_samples"]), state["active_samples"])
+        self.assertEqual(max(state["active_samples"]), 5)
+        self.assertGreaterEqual(len(state["tail_active"]), 6)
+        self.assertTrue(all(item >= 1 for item in state["tail_active"]), state["tail_active"])
+
+
+class _StreamingBackend:
+    """Session shaped like the real client. ``download_image_bytes`` is the production method."""
+
+    def __init__(self, tail_active: list[int] | None = None) -> None:
+        self.session = self
+        self.tail_active = tail_active if tail_active is not None else []
+
+    def get(self, url, timeout=120, stream=True):  # noqa: ARG002
+        tail_active = self.tail_active
+        header = _png(3840, 2160)
+
+        class _Response:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def iter_content(self, chunk_size=65536):  # noqa: ARG002
+                yield header[:64]
+                tail_active.append(guard.stats()["active"])
+                yield b"tail"
+
+            def close(self) -> None:
+                return None
+
+        return _Response()
+
+    def download_image_bytes(self, urls, size=None):
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        return OpenAIBackendAPI.download_image_bytes(self, urls, size=size)
+
+    def close(self) -> None:
+        return None
+
+
 if __name__ == "__main__":
     unittest.main()
