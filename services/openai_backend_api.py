@@ -2546,13 +2546,31 @@ class OpenAIBackendAPI:
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
-    def download_image_bytes(self, urls: list[str]) -> list[bytes]:
-        images = []
+    def download_image_bytes(self, urls: list[str], *, size: str | None = None) -> list[bytes]:
+        """Download image bytes. A free-pool large-image permit is held for large bodies.
+
+        ``stream=True`` keeps the first read to a header sniff unless the
+        declared size is already large, in which case the caller (or this
+        method) acquires before the body is assembled. The eventfd-safe
+        account lookup path is unrelated and is not changed here.
+        """
+        from services.free_large_image_guard import guarded_response_bytes
+
+        images: list[bytes] = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            response = self.session.get(url, timeout=120, stream=True)
+            try:
+                ensure_ok(response, "image_download")
+                data = guarded_response_bytes(response, declared_size=size, stage="native_download")
+            finally:
+                closer = getattr(response, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
+            if data not in images:
+                images.append(data)
         return images
 
     def stream_conversation(
