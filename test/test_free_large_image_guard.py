@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import random
 import struct
 import threading
 import time
@@ -1638,6 +1639,315 @@ class HandoffConservationTests(GuardTestCase):
         self.assertEqual(guard.stats()["heavy_waiting"], 0)
         self.assertEqual(guard.stats()["generating"], 0)
         self.assertIsNone(guard.consistency())
+
+    def test_owned_claim_takes_free_seat_ahead_of_full_queue(self) -> None:
+        """4 active + 10 waiting + 1 owned generation, with one heavy seat free.
+
+        The queued head has not run yet. Handoff must give that seat to the
+        head and keep this claim as the new tail. It must not raise, and it
+        must not count as a new rejection.
+        """
+        guard.configure_limits(wait_timeout_secs=5.0)
+        release_one = threading.Event()
+        release_all = threading.Event()
+        go = threading.Event()
+        errors: list[BaseException] = []
+        order: list[tuple[str, int]] = []
+        upstream = []
+        lock = threading.Lock()
+
+        def hold(index: int) -> None:
+            try:
+                with guard.heavy_image_work(declared_size="3840x2160", stage="held"):
+                    if index == 0:
+                        release_one.wait(timeout=5)
+                    else:
+                        release_all.wait(timeout=5)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def waiter(index: int) -> None:
+            try:
+                with guard.heavy_image_work(declared_size="2048x2048", stage="queued") as token:
+                    with lock:
+                        order.append(("w", index, 0 if token is None else token.id))
+                    release_all.wait(timeout=5)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def generate() -> None:
+            try:
+                with guard.bind_large_image_job("3840x2160") as token:
+                    assert token is not None
+                    gen_ids.append(token.id)
+                    go.wait(timeout=5)
+                    upstream.append(1)
+                    with guard.heavy_image_work(declared_size="3840x2160", stage="handoff") as current:
+                        with lock:
+                            order.append(("g", 0, 0 if current is None else current.id))
+                        release_all.wait(timeout=5)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        gen_ids: list[int] = []
+        holders = [threading.Thread(target=hold, args=(i,), name=f"hold-{i}") for i in range(5)]
+        for thread in holders:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["active"] == 5))
+        waiters = [threading.Thread(target=waiter, args=(i,), name=f"wait-{i}") for i in range(9)]
+        for thread in waiters:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["heavy_waiting"] == 9))
+        generator = threading.Thread(target=generate, name="owner")
+        generator.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 1 and len(gen_ids) == 1))
+        head_id = next(item["id"] for item in guard.token_snapshot() if item["queue_index"] == 0)
+        condition = guard._guard.cv
+        original_notify = condition.notify_all
+        quiet = {"on": False}
+
+        def notify_all() -> None:
+            if not quiet["on"]:
+                original_notify()
+
+        condition.notify_all = notify_all  # type: ignore[method-assign]
+        tenth = threading.Thread(target=waiter, args=(9,), name="wait-9")
+        try:
+            quiet["on"] = True
+            release_one.set()
+            self.assertTrue(self._wait_until(lambda: guard.stats()["active"] == 4), guard.stats())
+            tenth.start()
+            self.assertTrue(
+                self._wait_until(
+                    lambda: guard.stats()["active"] == 4
+                    and guard.stats()["heavy_waiting"] == 10
+                    and guard.stats()["generating"] == 1
+                ),
+                guard.stats(),
+            )
+            self.assertIsNone(guard.consistency())
+            rejected_before = guard.stats()["rejected"]
+            calls = {"body": 0}
+            with self.assertRaises(LargeImageAdmissionError) as fresh:
+                with guard.bind_large_image_job("4096x4096"):
+                    calls["body"] += 1
+            self.assertEqual(fresh.exception.reason, "queue_full")
+            self.assertEqual(calls["body"], 0)
+            self.assertEqual(guard.stats()["rejected"], rejected_before + 1)
+            self.assertEqual(guard.stats()["rejected_queue_full"], 1)
+            self.assertEqual(guard.stats()["rejected_handoff_full"], 0)
+            go.set()
+            self.assertTrue(
+                self._wait_until(
+                    lambda: guard.stats()["generating"] == 0
+                    and guard.stats()["active"] == 5
+                    and guard.stats()["heavy_waiting"] == 10
+                ),
+                guard.stats(),
+            )
+            self.assertEqual(guard.stats()["rejected"], rejected_before + 1)
+            self.assertFalse(errors, errors)
+            snapshot = {item["id"]: item for item in guard.token_snapshot()}
+            self.assertEqual(snapshot[head_id]["state"], "active")
+            self.assertIsNone(snapshot[head_id]["queue_index"])
+            self.assertEqual(snapshot[gen_ids[0]]["state"], "heavy_waiting")
+            self.assertEqual(snapshot[gen_ids[0]]["queue_index"], 9)
+            self.assertIsNone(guard.consistency())
+        finally:
+            quiet["on"] = False
+            condition.notify_all = original_notify  # type: ignore[method-assign]
+            with condition:
+                condition.notify_all()
+            release_all.set()
+            for thread in holders + waiters + [tenth, generator]:
+                if thread.ident is not None:
+                    thread.join(timeout=5)
+        for thread in holders + waiters + [tenth, generator]:
+            self.assertFalse(thread.is_alive(), thread.name)
+        self.assertFalse(errors, errors)
+        self.assertEqual(upstream, [1])
+        with lock:
+            seen = [item for item in order if item[0] in {"w", "g"}]
+        gen_at = next(i for i, item in enumerate(seen) if item[0] == "g")
+        head_at = next(i for i, item in enumerate(seen) if item[2] == head_id)
+        self.assertLess(head_at, gen_at)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertEqual(guard.stats()["heavy_waiting"], 0)
+        self.assertEqual(guard.stats()["generating"], 0)
+        self.assertIsNone(guard.consistency())
+
+    def test_cancel_and_timeout_do_not_reject_an_owned_claim(self) -> None:
+        guard.configure_limits(wait_timeout_secs=5.0)
+        release = threading.Event()
+        errors: list[BaseException] = []
+        holders = [
+            threading.Thread(
+                target=self._park_heavy,
+                args=(release, errors),
+                name=f"hold-{i}",
+            )
+            for i in range(5)
+        ]
+        for thread in holders:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["active"] == 5))
+        waiters = [
+            threading.Thread(target=self._park_heavy, args=(release, errors), name=f"wait-{i}")
+            for i in range(9)
+        ]
+        for thread in waiters:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["heavy_waiting"] == 9))
+        outcome: list[str] = []
+        upstream = []
+
+        def owner() -> None:
+            try:
+                with guard.bind_large_image_job("2K") as token:
+                    assert token is not None
+                    upstream.append(1)
+                    token.enter_heavy("download", 0.25)
+                    outcome.append("entered")
+                    token.leave_heavy()
+            except LargeImageAdmissionError as exc:
+                outcome.append(exc.reason)
+
+        worker = threading.Thread(target=owner)
+        worker.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 1 or outcome))
+        rejected_before = guard.stats()["rejected"]
+        worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, ["queue_timeout"])
+        self.assertEqual(upstream, [1])
+        self.assertEqual(guard.stats()["rejected"], rejected_before)
+        self.assertEqual(guard.stats()["generating"], 0)
+        self.assertEqual(guard.stats()["heavy_waiting"], 9)
+        self.assertEqual(guard.stats()["active"], 5)
+        self.assertIsNone(guard.consistency())
+
+        parked: list[int] = []
+
+        def cancellable() -> None:
+            try:
+                with guard.bind_large_image_job("4K") as token:
+                    assert token is not None
+                    parked.append(token.id)
+                    token.enter_heavy("download", 2)
+                    outcome.append("entered-after-cancel")
+                    token.leave_heavy()
+            except LargeImageAdmissionError as exc:
+                outcome.append(exc.reason)
+
+        # Waiting is 9, so this owner is admitted, then cancelled before heavy work.
+        other = threading.Thread(target=cancellable)
+        try:
+            other.start()
+            self.assertTrue(self._wait_until(lambda: len(parked) == 1))
+            self.assertTrue(guard.cancel_token(parked[0]) or outcome[-1:] == ["cancelled"])
+            other.join(timeout=3)
+            self.assertEqual(outcome, ["queue_timeout", "cancelled"])
+            self.assertEqual(guard.stats()["rejected"], rejected_before)
+            self.assertEqual(guard.stats()["generating"], 0)
+            self.assertNotIn("entered-after-cancel", outcome)
+            self.assertIsNone(guard.consistency())
+        finally:
+            release.set()
+            other.join(timeout=3)
+            for thread in holders + waiters:
+                thread.join(timeout=4)
+        self.assertFalse(errors, errors)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertEqual(guard.stats()["heavy_waiting"], 0)
+        self.assertEqual(guard.stats()["generating"], 0)
+
+    def test_seeded_schedules_match_token_states(self) -> None:
+        for seed in (1, 2, 3, 7, 11, 19, 23, 42):
+            with self.subTest(seed=seed):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(max_active=5, max_waiting=10, wait_timeout_secs=3.0)
+                self._run_seed(seed)
+                stats = guard.stats()
+                self.assertEqual(stats["active"], 0, stats)
+                self.assertEqual(stats["heavy_waiting"], 0, stats)
+                self.assertEqual(stats["generating"], 0, stats)
+                self.assertIsNone(guard.consistency(), stats)
+
+    def _run_seed(self, seed: int) -> None:
+        rng = random.Random(seed)
+        failures: list[str] = []
+        problems: list[str] = []
+        stop = threading.Event()
+
+        def sample() -> None:
+            while not stop.is_set():
+                problem = guard.consistency()
+                if problem:
+                    problems.append(problem)
+                stop.wait(0.002)
+
+        def worker(index: int) -> None:
+            local = random.Random(seed * 1000 + index)
+            entered_body = False
+            try:
+                time.sleep(local.random() * 0.01)
+                if local.randrange(3) == 0:
+                    with guard.bind_large_image_job("3840x2160"):
+                        entered_body = True
+                        time.sleep(local.random() * 0.004)
+                        with guard.heavy_image_work(declared_size="3840x2160", stage="seed"):
+                            if local.random() < 0.15:
+                                raise RuntimeError("decode")
+                            time.sleep(local.random() * 0.006)
+                else:
+                    with guard.heavy_image_work(declared_size="2048x2048", stage="seed"):
+                        entered_body = True
+                        time.sleep(local.random() * 0.006)
+            except LargeImageAdmissionError as exc:
+                if entered_body and exc.reason == "handoff_full":
+                    failures.append(f"{seed}:{index} owner handoff_full")
+                elif entered_body and exc.reason not in {"queue_timeout", "cancelled"}:
+                    failures.append(f"{seed}:{index} {exc.reason}")
+            except RuntimeError:
+                return
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(f"{seed}:{index} {exc!r}")
+
+        sampler = threading.Thread(target=sample, name=f"sample-{seed}", daemon=True)
+        sampler.start()
+        threads = [threading.Thread(target=worker, args=(i,), name=f"s{seed}-{i}") for i in range(24)]
+        for thread in threads:
+            thread.start()
+        cancel_rng = random.Random(seed + 99)
+        for _ in range(8):
+            time.sleep(0.005)
+            victims = [
+                item for item in guard.token_snapshot()
+                if item["state"] in {"generating", "heavy_waiting"}
+            ]
+            if victims and cancel_rng.random() < 0.7:
+                guard.cancel_token(int(cancel_rng.choice(victims)["id"]))
+        for thread in threads:
+            thread.join(timeout=4)
+            if thread.is_alive():
+                failures.append(f"{seed} stuck {thread.name}")
+        stop.set()
+        sampler.join(timeout=1)
+        self.assertFalse(failures, failures)
+        self.assertFalse(problems, problems)
+        # Rejections, when they happened, were new admissions only.
+        stats = guard.stats()
+        self.assertEqual(
+            stats["rejected"],
+            stats["rejected_queue_full"] + stats["rejected_generation_busy"] + stats["rejected_handoff_full"],
+        )
+
+    def _park_heavy(self, release: threading.Event, errors: list[BaseException]) -> None:
+        try:
+            with guard.heavy_image_work(declared_size="3840x2160", stage="park"):
+                release.wait(timeout=5)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
 
     def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
         return ConcurrencyTests._wait_until(self, predicate, timeout)

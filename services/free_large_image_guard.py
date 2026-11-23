@@ -45,9 +45,17 @@ finish together, five become ``active`` and ten become ``heavy_waiting``.
 Nothing sits in an uncounted gate, and no finished result is dropped or
 regenerated to make the numbers fit.
 
+Those caps are checked again only for a new admission. A task that already
+holds a claim is never rejected because its own claim makes the pool look
+full. If a heavy seat is free and waiters are queued, that seat goes to the
+head of the queue and this task takes the waiting seat the head vacated.
+Both updates happen before the lock is released, so the queue stays at 10
+and the finished result stays on this attempt.
+
 ``queue_full`` means the 10-slot heavy queue is already full. ``handoff_full``
 means the 15 claims are taken. ``generation_busy`` means the absolute
-generating cap is taken. All three happen before a new upstream call.
+generating cap is taken. All three happen before a new upstream call and
+increment the rejected counters. A handoff of an owned claim does not.
 
 180s is one image download timeout (120s, see ``download_image_bytes``)
 plus the default poll timeout margin. 60s would expire while a permitted
@@ -208,6 +216,7 @@ class Token:
         self.work_running = False
         self.depth = 0
         self.stage = ""
+        self.fail_reason = ""
 
     def cancel(self) -> bool:
         """Cancel a job that has not entered heavy work. Never drops an active permit."""
@@ -245,103 +254,166 @@ class Token:
         elif self.state == "heavy_waiting" and guard.heavy_waiting > 0:
             guard.heavy_waiting -= 1
 
-    def _become_heavy_waiter_locked(self) -> None:
-        """Move generating -> heavy_waiting in this critical section.
+    def _arm_active_locked(self) -> bool:
+        """Enter an active permit. A nested call on the owner thread only deepens it."""
+        if self.state != "active":
+            return False
+        if self.work_running:
+            self.depth += 1
+        else:
+            self.work_running = True
+            self.depth = 1
+        return True
 
-        The task already holds a pipeline claim, so the waiting cap has room.
-        On the unreachable overflow path the task stays ``generating`` and the
-        error propagates; nothing is dropped from the counters first.
+    def _activate_locked(self) -> None:
+        """Move this token into active. The owner thread arms depth afterwards.
+
+        Depth is not set here. The token may still be outside ``enter_heavy``
+        (queued by admission, not yet parked), and arming it from another
+        thread would leak the slot on the real enter.
         """
         guard = self.guard
-        if self.state == "heavy_waiting":
+        guard.active += 1
+        if guard.active > guard.peak_active:
+            guard.peak_active = guard.active
+        self.state = "active"
+        if self.stage == "":
+            self.stage = "heavy"
+        guard.cv.notify_all()
+
+    def _abandon_locked(self, reason: str) -> None:
+        """Drop one owned claim. Active work that has armed the permit stays."""
+        if self.state == "done" or (self.state == "active" and self.work_running):
             return
-        if self.cancelled or self.state == "done":
+        guard = self.guard
+        if self in guard.heavy_queue:
+            guard.heavy_queue.remove(self)
+        if self.state == "generating" and guard.generating > 0:
+            guard.generating -= 1
+        elif self.state == "heavy_waiting" and guard.heavy_waiting > 0:
+            guard.heavy_waiting -= 1
+        elif self.state == "active" and guard.active > 0:
+            guard.active -= 1
+        if reason == "queue_timeout":
+            guard.timed_out += 1
+            logger.warning(
+                "free_large_image heavy-entry timeout active=%s heavy_waiting=%s generating=%s stage=%s",
+                guard.active,
+                guard.heavy_waiting,
+                guard.generating,
+                self.stage,
+            )
+        elif reason == "cancelled":
             guard.cancelled += 1
-            raise LargeImageAdmissionError("cancelled")
+        self.fail_reason = reason
+        self.state = "done"
+        self.work_running = False
+        self.depth = 0
+        guard.tokens.pop(self.id, None)
+        guard.cv.notify_all()
+
+    def _reap_cancelled_head_locked(self) -> bool:
+        guard = self.guard
+        if not guard.heavy_queue:
+            return False
+        head = guard.heavy_queue[0]
+        if head is self or not head.cancelled or head.state != "heavy_waiting":
+            return False
+        head._abandon_locked("cancelled")
+        return True
+
+    def _handoff_owned_claim_locked(self) -> None:
+        """Use the claim this task already holds. Never a new admission.
+
+        A free heavy seat with a non-empty queue belongs to the FIFO head.
+        Promoting that head frees the waiting seat this claim reserved, so a
+        full queue of 10 does not reject the owner and does not jump the line.
+        """
+        guard = self.guard
         if self.state != "generating":
-            guard.cancelled += 1
-            raise LargeImageAdmissionError("cancelled")
+            return
+        while self._reap_cancelled_head_locked():
+            pass
+        if (
+            guard.heavy_queue
+            and guard.active < guard.max_active
+            and guard.heavy_queue[0] is not self
+            and guard.heavy_queue[0].state == "heavy_waiting"
+        ):
+            head = guard.heavy_queue.popleft()
+            if guard.heavy_waiting > 0:
+                guard.heavy_waiting -= 1
+            head._activate_locked()
+        if self.state != "generating":
+            return
+        if not guard.heavy_queue and guard.active < guard.max_active:
+            if guard.generating > 0:
+                guard.generating -= 1
+            self._activate_locked()
+            return
         if guard.heavy_waiting >= guard.max_heavy_waiting:
-            raise LargeImageAdmissionError("handoff_full")
+            # Both seats are full. Stay counted as generating until one frees.
+            # Admission should have made this unreachable; do not drop the result.
+            return
         if guard.generating > 0:
             guard.generating -= 1
         guard.heavy_waiting += 1
         if guard.heavy_waiting > guard.peak_heavy_waiting:
             guard.peak_heavy_waiting = guard.heavy_waiting
         self.state = "heavy_waiting"
-
-    def _take_active_locked(self, stage: str) -> None:
-        guard = self.guard
-        guard.active += 1
-        if guard.active > guard.peak_active:
-            guard.peak_active = guard.active
-        self.state = "active"
-        self.work_running = True
-        self.depth = 1
-        self.stage = stage
-        guard.cv.notify_all()
+        if self not in guard.heavy_queue:
+            guard.heavy_queue.append(self)
 
     def enter_heavy(self, stage: str, timeout: float) -> None:
         guard = self.guard
         deadline = time.monotonic() + max(0.0, timeout)
         with guard.cv:
-            if self.state == "active" and self.work_running:
-                self.depth += 1
+            if self._arm_active_locked():
                 return
-            if self.cancelled or self.state == "done":
-                guard.cancelled += 1
+            if self.state == "done":
+                raise LargeImageAdmissionError(self.fail_reason or "cancelled")
+            if self.cancelled:
+                self._abandon_locked("cancelled")
                 raise LargeImageAdmissionError("cancelled")
-            # Empty queue and a free heavy slot: convert in place. A waiting
-            # seat is not used, so a zero-length queue still hands off.
-            if (
-                self.state == "generating"
-                and not guard.heavy_queue
-                and guard.active < guard.max_active
-            ):
-                if guard.generating > 0:
-                    guard.generating -= 1
-                self._take_active_locked(stage)
-                return
-            self._become_heavy_waiter_locked()
-            if self not in guard.heavy_queue:
-                guard.heavy_queue.append(self)
+            self.stage = stage
             try:
-                while True:
-                    if self.cancelled:
-                        guard.cancelled += 1
+                while self.state != "active":
+                    if self.state == "done":
+                        raise LargeImageAdmissionError(self.fail_reason or "cancelled")
+                    if self.cancelled and self.state in {"generating", "heavy_waiting"}:
+                        self._abandon_locked("cancelled")
                         raise LargeImageAdmissionError("cancelled")
-                    head_ok = bool(guard.heavy_queue) and guard.heavy_queue[0] is self
-                    if guard.active < guard.max_active and head_ok:
-                        guard.heavy_queue.popleft()
-                        break
+                    if self.state == "generating":
+                        self._handoff_owned_claim_locked()
+                        if self._arm_active_locked():
+                            return
+                    if self.state == "heavy_waiting":
+                        if self not in guard.heavy_queue:
+                            guard.heavy_queue.append(self)
+                        head_ok = bool(guard.heavy_queue) and guard.heavy_queue[0] is self
+                        if guard.active < guard.max_active and head_ok:
+                            guard.heavy_queue.popleft()
+                            if guard.heavy_waiting > 0:
+                                guard.heavy_waiting -= 1
+                            self._activate_locked()
+                            self._arm_active_locked()
+                            return
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        guard.timed_out += 1
-                        logger.warning(
-                            "free_large_image heavy-entry timeout active=%s heavy_waiting=%s generating=%s stage=%s",
-                            guard.active,
-                            guard.heavy_waiting,
-                            guard.generating,
-                            stage,
-                        )
+                        self._abandon_locked("queue_timeout")
                         raise LargeImageAdmissionError("queue_timeout")
                     guard.cv.wait(remaining)
-            except BaseException:
-                if self in guard.heavy_queue:
-                    guard.heavy_queue.remove(self)
-                # The wait failed. Drop the claim before releasing the lock so
-                # the task is not a counted waiter outside the queue, and so
-                # close() cannot free the same claim twice.
-                if self.state == "heavy_waiting":
-                    if guard.heavy_waiting > 0:
-                        guard.heavy_waiting -= 1
-                    self.state = "done"
-                    guard.tokens.pop(self.id, None)
-                    guard.cv.notify_all()
+                self._arm_active_locked()
+            except BaseException as exc:
+                if self.state in {"generating", "heavy_waiting"}:
+                    reason = ""
+                    if isinstance(exc, LargeImageAdmissionError) and exc.reason in {
+                        "cancelled",
+                        "queue_timeout",
+                    }:
+                        reason = exc.reason
+                    self._abandon_locked(reason)
                 raise
-            if guard.heavy_waiting > 0:
-                guard.heavy_waiting -= 1
-            self._take_active_locked(stage)
 
     def leave_heavy(self) -> None:
         guard = self.guard
@@ -461,8 +533,14 @@ def cancel_token(token_id: int) -> bool:
 def token_snapshot() -> list[dict[str, Any]]:
     """Ids and states only. No prompts, keys, URLs, or image bytes."""
     with _guard.cv:
+        positions = {token.id: index for index, token in enumerate(_guard.heavy_queue)}
         return [
-            {"id": token.id, "state": token.state, "stage": token.stage}
+            {
+                "id": token.id,
+                "state": token.state,
+                "stage": token.stage,
+                "queue_index": positions.get(token.id),
+            }
             for token in _guard.tokens.values()
         ]
 
@@ -877,16 +955,20 @@ def consistency() -> str | None:
             elif token.state not in {"done", "new"}:
                 return "unexpected state " + token.state
         if counts["generating"] != _guard.generating:
-            return "generating counter"
+            return f"generating counter tokens={counts['generating']} counter={_guard.generating}"
         if counts["heavy_waiting"] != _guard.heavy_waiting:
-            return "heavy_waiting counter"
+            return f"heavy_waiting counter tokens={counts['heavy_waiting']} counter={_guard.heavy_waiting}"
         if counts["active"] != _guard.active:
-            return "active counter"
+            return f"active counter tokens={counts['active']} counter={_guard.active}"
         queued = [token for token in _guard.heavy_queue if token.state != "heavy_waiting"]
         if queued:
             return "queue holds " + queued[0].state
         if any(token not in _guard.heavy_queue for token in _guard.tokens.values() if token.state == "heavy_waiting"):
             return "heavy_waiting missing from queue"
+        if len(_guard.heavy_queue) != _guard.heavy_waiting:
+            return "queue length"
+        if any(token.state == "generating" for token in _guard.heavy_queue):
+            return "generating in queue"
         if _guard.active > _guard.max_active:
             return "active cap"
         if _guard.heavy_waiting > _guard.max_heavy_waiting:
