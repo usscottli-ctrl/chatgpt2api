@@ -1347,6 +1347,7 @@ def stream_codex_image_outputs(
 def _admission_error_code(reason: str) -> str:
     return {
         "queue_full": "free_large_image_queue_full",
+        "handoff_full": "free_large_image_handoff_full",
         "generation_busy": "free_large_image_generation_busy",
         "queue_timeout": "free_large_image_queue_timeout",
     }.get(reason, "free_large_image_busy")

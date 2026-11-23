@@ -32,15 +32,22 @@ Defaults (free pool only):
 - heavy-entry wait: 180s
 
 ``generating`` is not the heavy queue. An upstream poll holds a thread and a
-small response stream, not a decoded frame. Its cap is four in-flight
-requests per heavy slot because the public API already limits ``n`` to 4, so
-each heavy slot can have one full batch upstream without retaining pixel
-buffers. Past that, admission returns ``generation_busy`` and does not call
-upstream.
+small response stream, not a decoded frame. Its absolute cap is four
+in-flight requests per heavy slot (``n <= 4``). It does not increment
+``heavy_waiting``.
 
-``queue_full`` is only the heavy queue: 10 jobs are already waiting to
-allocate and a new large request must not start. Ten generations with
-``active == 0`` do not fill that queue and must still be admitted.
+Every live task is in exactly one of ``generating``, ``heavy_waiting``, or
+``active``. A generation also holds one handoff claim on the heavy pipeline
+(``active + heavy_waiting + generating <= 5 + 10``). That is why twenty
+upstream calls cannot all finish into the heavy stage: only fifteen claims
+exist, so the sixteenth request is refused before upstream. When the fifteen
+finish together, five become ``active`` and ten become ``heavy_waiting``.
+Nothing sits in an uncounted gate, and no finished result is dropped or
+regenerated to make the numbers fit.
+
+``queue_full`` means the 10-slot heavy queue is already full. ``handoff_full``
+means the 15 claims are taken. ``generation_busy`` means the absolute
+generating cap is taken. All three happen before a new upstream call.
 
 180s is one image download timeout (120s, see ``download_image_bytes``)
 plus the default poll timeout margin. 60s would expire while a permitted
@@ -74,8 +81,9 @@ MAX_ACTIVE = 5
 # Jobs blocked before download/decode. Two waves behind the 5 heavy slots.
 MAX_HEAVY_WAITING = 10
 MAX_WAITING = MAX_HEAVY_WAITING
-# Upstream generations. Four per heavy slot matches the API's n<=4 batch
-# without holding decoded frames. Not the heavy-memory queue.
+# Absolute ceiling on upstream generations. The heavy pipeline only has
+# MAX_ACTIVE + MAX_HEAVY_WAITING handoff claims, so admission stops there
+# even when this ceiling is higher.
 MAX_GENERATING = MAX_ACTIVE * 4
 # 120s download timeout + 60s for one wave of decode/upscale/base64.
 WAIT_TIMEOUT_SECS = 180
@@ -98,9 +106,10 @@ _tls = threading.local()
 class LargeImageAdmissionError(Exception):
     """Raised before a new upstream generation, or when heavy entry times out.
 
-    ``reason`` is ``queue_full`` (heavy queue saturated), ``generation_busy``
-    (upstream cap), ``queue_timeout``, or ``cancelled``. Callers must not
-    start a replacement generation for the same attempt.
+    ``reason`` is ``queue_full`` (heavy queue saturated), ``handoff_full``
+    (no heavy-pipeline claim left), ``generation_busy`` (upstream cap),
+    ``queue_timeout``, or ``cancelled``. Callers must not start a replacement
+    generation for the same attempt.
     """
 
     def __init__(self, reason: str) -> None:
@@ -124,6 +133,7 @@ class _Guard:
         self.rejected = 0
         self.rejected_queue_full = 0
         self.rejected_generation_busy = 0
+        self.rejected_handoff_full = 0
         self.timed_out = 0
         self.cancelled = 0
         self.peak_active = 0
@@ -151,8 +161,10 @@ class _Guard:
                 "wait_timeout_secs": self.wait_timeout_secs,
                 "threshold_pixels": self.threshold,
                 "rejected": self.rejected,
+                "pipeline_limit": self.max_active + self.max_heavy_waiting,
                 "rejected_queue_full": self.rejected_queue_full,
                 "rejected_generation_busy": self.rejected_generation_busy,
+                "rejected_handoff_full": self.rejected_handoff_full,
                 "timed_out": self.timed_out,
                 "cancelled": self.cancelled,
                 "peak_active": self.peak_active,
@@ -171,6 +183,7 @@ class _Guard:
             self.rejected = 0
             self.rejected_queue_full = 0
             self.rejected_generation_busy = 0
+            self.rejected_handoff_full = 0
             self.timed_out = 0
             self.cancelled = 0
             self.peak_active = 0
@@ -188,7 +201,7 @@ class Token:
     def __init__(self, guard: _Guard) -> None:
         self.guard = guard
         self.id = 0
-        # generating | heavy_waiting | active | admitted | done
+        # generating | heavy_waiting | active | done
         self.state = "new"
         self.cancelled = False
         self.closed = False
@@ -232,36 +245,41 @@ class Token:
         elif self.state == "heavy_waiting" and guard.heavy_waiting > 0:
             guard.heavy_waiting -= 1
 
-    def _join_heavy_waiting_locked(self, deadline: float) -> None:
-        """Count this job as a heavy waiter. Generation reservations are dropped first."""
+    def _become_heavy_waiter_locked(self) -> None:
+        """Move generating -> heavy_waiting in this critical section.
+
+        The task already holds a pipeline claim, so the waiting cap has room.
+        On the unreachable overflow path the task stays ``generating`` and the
+        error propagates; nothing is dropped from the counters first.
+        """
         guard = self.guard
         if self.state == "heavy_waiting":
             return
         if self.cancelled or self.state == "done":
             guard.cancelled += 1
             raise LargeImageAdmissionError("cancelled")
-        if self.state == "generating":
-            if guard.generating > 0:
-                guard.generating -= 1
-            self.state = "heavy_gate"
-        elif self.state == "admitted":
-            self.state = "heavy_gate"
-        elif self.state != "heavy_waiting":
+        if self.state != "generating":
             guard.cancelled += 1
             raise LargeImageAdmissionError("cancelled")
-        while self.state == "heavy_gate" and guard.heavy_waiting >= guard.max_heavy_waiting:
-            if self.cancelled:
-                guard.cancelled += 1
-                raise LargeImageAdmissionError("cancelled")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                guard.timed_out += 1
-                raise LargeImageAdmissionError("queue_timeout")
-            guard.cv.wait(remaining)
+        if guard.heavy_waiting >= guard.max_heavy_waiting:
+            raise LargeImageAdmissionError("handoff_full")
+        if guard.generating > 0:
+            guard.generating -= 1
         guard.heavy_waiting += 1
         if guard.heavy_waiting > guard.peak_heavy_waiting:
             guard.peak_heavy_waiting = guard.heavy_waiting
         self.state = "heavy_waiting"
+
+    def _take_active_locked(self, stage: str) -> None:
+        guard = self.guard
+        guard.active += 1
+        if guard.active > guard.peak_active:
+            guard.peak_active = guard.active
+        self.state = "active"
+        self.work_running = True
+        self.depth = 1
+        self.stage = stage
+        guard.cv.notify_all()
 
     def enter_heavy(self, stage: str, timeout: float) -> None:
         guard = self.guard
@@ -273,8 +291,20 @@ class Token:
             if self.cancelled or self.state == "done":
                 guard.cancelled += 1
                 raise LargeImageAdmissionError("cancelled")
-            self._join_heavy_waiting_locked(deadline)
-            guard.heavy_queue.append(self)
+            # Empty queue and a free heavy slot: convert in place. A waiting
+            # seat is not used, so a zero-length queue still hands off.
+            if (
+                self.state == "generating"
+                and not guard.heavy_queue
+                and guard.active < guard.max_active
+            ):
+                if guard.generating > 0:
+                    guard.generating -= 1
+                self._take_active_locked(stage)
+                return
+            self._become_heavy_waiter_locked()
+            if self not in guard.heavy_queue:
+                guard.heavy_queue.append(self)
             try:
                 while True:
                     if self.cancelled:
@@ -299,17 +329,19 @@ class Token:
             except BaseException:
                 if self in guard.heavy_queue:
                     guard.heavy_queue.remove(self)
+                # The wait failed. Drop the claim before releasing the lock so
+                # the task is not a counted waiter outside the queue, and so
+                # close() cannot free the same claim twice.
+                if self.state == "heavy_waiting":
+                    if guard.heavy_waiting > 0:
+                        guard.heavy_waiting -= 1
+                    self.state = "done"
+                    guard.tokens.pop(self.id, None)
+                    guard.cv.notify_all()
                 raise
             if guard.heavy_waiting > 0:
                 guard.heavy_waiting -= 1
-            guard.active += 1
-            if guard.active > guard.peak_active:
-                guard.peak_active = guard.active
-            self.state = "active"
-            self.work_running = True
-            self.depth = 1
-            self.stage = stage
-            guard.cv.notify_all()
+            self._take_active_locked(stage)
 
     def leave_heavy(self) -> None:
         guard = self.guard
@@ -329,9 +361,10 @@ class Token:
                 self.state = "done"
                 guard.tokens.pop(self.id, None)
             else:
-                # Heavy phase finished. Do not occupy the heavy queue while the
-                # caller still holds the request for a later phase or for close.
-                self.state = "admitted"
+                # The heavy section is over. The task is no longer generating
+                # or waiting; close() is idempotent if it runs next.
+                self.state = "done"
+                guard.tokens.pop(self.id, None)
             guard.cv.notify_all()
 
 
@@ -772,12 +805,22 @@ def _new_token(state: str) -> Token:
     return token
 
 
+def _pipeline_limit() -> int:
+    return _guard.max_active + _guard.max_heavy_waiting
+
+
+def _occupied_locked() -> int:
+    return _guard.active + _guard.heavy_waiting + _guard.generating
+
+
 def _reject(reason: str) -> None:
     _guard.rejected += 1
     if reason == "queue_full":
         _guard.rejected_queue_full += 1
     elif reason == "generation_busy":
         _guard.rejected_generation_busy += 1
+    elif reason == "handoff_full":
+        _guard.rejected_handoff_full += 1
     logger.warning(
         "free_large_image reject reason=%s active=%s heavy_waiting=%s generating=%s",
         reason,
@@ -789,10 +832,16 @@ def _reject(reason: str) -> None:
 
 
 def _begin_generation() -> Token:
-    """Count an upstream large-image generation. Does not take a heavy slot."""
+    """Count an upstream large-image generation. Does not take a heavy slot.
+
+    The job still consumes one handoff claim so it can become active or
+    heavy_waiting later without exceeding those caps or dropping the result.
+    """
     with _guard.cv:
         if _guard.heavy_waiting >= _guard.max_heavy_waiting:
             _reject("queue_full")
+        if _occupied_locked() >= _pipeline_limit():
+            _reject("handoff_full")
         if _guard.generating >= _guard.max_generating:
             _reject("generation_busy")
         _guard.generating += 1
@@ -806,25 +855,64 @@ def _begin_heavy_waiter() -> Token:
     with _guard.cv:
         if _guard.heavy_waiting >= _guard.max_heavy_waiting:
             _reject("queue_full")
+        if _occupied_locked() >= _pipeline_limit():
+            _reject("handoff_full")
         _guard.heavy_waiting += 1
         if _guard.heavy_waiting > _guard.peak_heavy_waiting:
             _guard.peak_heavy_waiting = _guard.heavy_waiting
-        return _new_token("heavy_waiting")
+        token = _new_token("heavy_waiting")
+        _guard.heavy_queue.append(token)
+        return token
+
+
+def consistency() -> str | None:
+    """Return a problem string when counters disagree with token states or caps."""
+    with _guard.cv:
+        counts = {"generating": 0, "heavy_waiting": 0, "active": 0}
+        for token in _guard.tokens.values():
+            if token.state == "heavy_gate":
+                return "hidden heavy_gate"
+            if token.state in counts:
+                counts[token.state] += 1
+            elif token.state not in {"done", "new"}:
+                return "unexpected state " + token.state
+        if counts["generating"] != _guard.generating:
+            return "generating counter"
+        if counts["heavy_waiting"] != _guard.heavy_waiting:
+            return "heavy_waiting counter"
+        if counts["active"] != _guard.active:
+            return "active counter"
+        queued = [token for token in _guard.heavy_queue if token.state != "heavy_waiting"]
+        if queued:
+            return "queue holds " + queued[0].state
+        if any(token not in _guard.heavy_queue for token in _guard.tokens.values() if token.state == "heavy_waiting"):
+            return "heavy_waiting missing from queue"
+        if _guard.active > _guard.max_active:
+            return "active cap"
+        if _guard.heavy_waiting > _guard.max_heavy_waiting:
+            return "heavy_waiting cap"
+        if _guard.generating > _guard.max_generating:
+            return "generating cap"
+        if _occupied_locked() > _pipeline_limit():
+            return "pipeline cap"
+        return None
 
 
 @contextmanager
 def bind_large_image_job(size: object) -> Iterator[Token | None]:
     """Admit one large-output generation before the upstream call.
 
-    This reserves a generating slot, not a heavy-memory slot. A full heavy
-    queue refuses admission. A full generating cap refuses admission. Neither
-    starts upstream work. Small sizes and a disabled guard are no-ops.
+    This reserves a generating slot, not a heavy-memory slot, plus one
+    handoff claim (active + heavy waiting + generating <= 5 + 10). A full
+    heavy queue, a full claim pool, or a full generating cap refuses
+    admission before upstream work. Small sizes and a disabled guard are
+    no-ops.
     """
     if not is_enabled() or not is_large_size(size):
         yield None
         return
     current = _current_token()
-    if current is not None and current.state in {"generating", "heavy_waiting", "active", "admitted"}:
+    if current is not None and current.state in {"generating", "heavy_waiting", "active"}:
         yield current
         return
     token = _begin_generation()
@@ -862,7 +950,7 @@ class _HeavyPipeline:
             return
         if self.token is None:
             current = _current_token()
-            if current is None or current.state not in {"generating", "heavy_waiting", "active", "admitted"}:
+            if current is None or current.state not in {"generating", "heavy_waiting", "active"}:
                 current = _begin_heavy_waiter()
                 self.owned = True
                 _push_token(current)
@@ -969,7 +1057,7 @@ def heavy_image_work(
         return
     token = _current_token()
     owned = False
-    if token is None or token.state not in {"generating", "heavy_waiting", "active", "admitted"}:
+    if token is None or token.state not in {"generating", "heavy_waiting", "active"}:
         token = _begin_heavy_waiter()
         owned = True
         _push_token(token)
