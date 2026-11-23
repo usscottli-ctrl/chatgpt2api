@@ -52,7 +52,16 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     prompt = str(body.get("prompt") or "")
     images = body.get("images") or []
     masks = body.get("mask") or []
-    images = _composite_mask(images, masks)
+    from services.free_large_image_guard import edit_input_guard_pixels, heavy_image_work
+
+    guard_pixels = edit_input_guard_pixels(images, masks)
+    if guard_pixels:
+        with heavy_image_work(discovered_pixels=guard_pixels, stage="edit_input"):
+            images = _composite_mask(images, masks)
+            encoded_images = encode_images(images)
+    else:
+        images = _composite_mask(images, masks)
+        encoded_images = encode_images(images)
     model = str(body.get("model") or "gpt-image-2")
     n = int(body.get("n") or 1)
     size = body.get("size")
@@ -60,7 +69,6 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
-    encoded_images = encode_images(images)
     if not encoded_images:
         raise ImageGenerationError("image is required")
     outputs = stream_image_outputs_with_pool(ConversationRequest(

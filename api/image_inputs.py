@@ -269,22 +269,33 @@ def _download_image_url(url: str) -> ImageInput:
             headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
             timeout=60,
             allow_redirects=True,
+            stream=True,
             **proxy_settings.build_session_kwargs(),
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = _clean(response.headers.get("content-length"))
-    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    data = response.content
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    mime_type = _response_mime_type(response, parsed.path)
-    return data, _filename_from_url(parsed.path, mime_type), mime_type
+    try:
+        if not 200 <= response.status_code < 300:
+            raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
+        content_length = _clean(response.headers.get("content-length"))
+        if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
+        from services.free_large_image_guard import guarded_response_bytes
+
+        data = guarded_response_bytes(response, stage="edit_reference_download")
+        if not data:
+            raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+        if len(data) > MAX_IMAGE_REFERENCE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
+        mime_type = _response_mime_type(response, parsed.path)
+        return data, _filename_from_url(parsed.path, mime_type), mime_type
+    finally:
+        closer = getattr(response, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
 
 
 async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:

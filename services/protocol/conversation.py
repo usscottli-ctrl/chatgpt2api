@@ -262,6 +262,36 @@ def count_text_tokens(text: str, model: str) -> int:
     return len(encoding_for_model(model).encode(text))
 
 
+def _store_processed_image(
+    raw: bytes,
+    *,
+    prompt: str,
+    response_format: str,
+    base_url: str | None,
+    size: str | None,
+    original_b64: str,
+) -> dict[str, Any]:
+    """Decode once, optionally upscale, and avoid a second base64 copy when unchanged."""
+    from services.free_large_image_guard import postprocess_image_bytes
+
+    processed = postprocess_image_bytes(raw, size)
+    revised_prompt = prompt
+    if response_format == "b64_json":
+        if processed is raw and original_b64:
+            b64_json = original_b64
+        else:
+            b64_json = base64.b64encode(processed).decode("ascii")
+        return {
+            "b64_json": b64_json,
+            "url": save_image_bytes(processed, base_url),
+            "revised_prompt": revised_prompt,
+        }
+    return {
+        "url": save_image_bytes(processed, base_url),
+        "revised_prompt": revised_prompt,
+    }
+
+
 def format_image_result(
     items: list[dict[str, Any]],
     prompt: str,
@@ -269,28 +299,84 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    size: str | None = None,
 ) -> dict[str, Any]:
+    from services.free_large_image_guard import b64_guard_pixels, heavy_image_work
+
     data: list[dict[str, Any]] = []
     for item in items:
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        if response_format == "b64_json":
-            data.append({
-                "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
+        guard_pixels = b64_guard_pixels(b64_json, size)
+
+        def _one(payload: str = b64_json, revised: str = revised_prompt) -> dict[str, Any]:
+            raw = base64.b64decode(payload)
+            stored = _store_processed_image(
+                raw,
+                prompt=revised,
+                response_format=response_format,
+                base_url=base_url,
+                size=size,
+                original_b64=payload,
+            )
+            return stored
+
+        if guard_pixels:
+            with heavy_image_work(discovered_pixels=guard_pixels, stage="decode_upscale"):
+                data.append(_one())
         else:
-            data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
-                "revised_prompt": revised_prompt,
-            })
+            data.append(_one())
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message
     return result
+
+
+def _materialize_image_output(
+    backend: OpenAIBackendAPI,
+    request: ConversationRequest,
+    image_urls: list[str],
+    index: int,
+    total: int,
+    conversation_id: str,
+) -> ImageOutput | None:
+    """Download and store one result while one large-image permit is held.
+
+    Declared 2K/4K takes the permit before the download. A 1K, auto, or
+    missing size still takes it when the body header is actually large, and
+    that permit stays held through decode, upscale, and base64. The download
+    helper must not release it when it returns.
+    """
+    if request.progress_callback:
+        request.progress_callback("receiving_image")
+    from services.free_large_image_guard import heavy_image_pipeline
+
+    with heavy_image_pipeline(declared_size=request.size, stage="download_decode"):
+        blobs = list(backend.download_image_bytes(image_urls, size=request.size))
+        data: list[dict[str, Any]] = []
+        for raw in blobs:
+            if not raw:
+                continue
+            data.append(_store_processed_image(
+                raw,
+                prompt=request.prompt,
+                response_format=request.response_format,
+                base_url=request.base_url,
+                size=request.size,
+                original_b64="",
+            ))
+    if not data:
+        return None
+    return ImageOutput(
+        kind="result",
+        model=request.model,
+        index=index,
+        total=total,
+        data=data,
+        conversation_id=conversation_id,
+    )
 
 
 @dataclass
@@ -999,21 +1085,11 @@ def stream_image_outputs(
             raise
 
     if image_urls:
-        if request.progress_callback:
-            request.progress_callback("receiving_image")
-        image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
-            for image_data in backend.download_image_bytes(image_urls)
-        ]
-        data = format_image_result(
-            image_items,
-            request.prompt,
-            request.response_format,
-            request.base_url,
-            int(time.time()),
-        )["data"]
-        if data:
-            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+        output = _materialize_image_output(
+            backend, request, image_urls, index, total, conversation_id,
+        )
+        if output is not None:
+            yield output
         return
 
     if message:
@@ -1096,21 +1172,11 @@ def stream_image_outputs(
                     conversation_id, file_ids, sediment_ids, poll=False,
                 )
                 if image_urls:
-                    if request.progress_callback:
-                        request.progress_callback("receiving_image")
-                    image_items = [
-                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                        for image_data in backend.download_image_bytes(image_urls)
-                    ]
-                    data = format_image_result(
-                        image_items,
-                        request.prompt,
-                        request.response_format,
-                        request.base_url,
-                        int(time.time()),
-                    )["data"]
-                    if data:
-                        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+                    output = _materialize_image_output(
+                        backend, request, image_urls, index, total, conversation_id,
+                    )
+                    if output is not None:
+                        yield output
                         return
         elif is_text_reply:
             logger.warning({
@@ -1208,21 +1274,11 @@ def stream_image_outputs(
                 conversation_id, file_ids, sediment_ids, poll=False,
             )
             if image_urls:
-                if request.progress_callback:
-                    request.progress_callback("receiving_image")
-                image_items = [
-                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                    for image_data in backend.download_image_bytes(image_urls)
-                ]
-                data = format_image_result(
-                    image_items,
-                    request.prompt,
-                    request.response_format,
-                    request.base_url,
-                    int(time.time()),
-                )["data"]
-                if data:
-                    yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+                output = _materialize_image_output(
+                    backend, request, image_urls, index, total, conversation_id,
+                )
+                if output is not None:
+                    yield output
                     return
         
         # 重试后仍然失败，yield 错误消息
@@ -1280,6 +1336,7 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        size=request.size,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
@@ -1287,7 +1344,41 @@ def stream_codex_image_outputs(
     raise ImageGenerationError("No image result found in response")
 
 
+def _admission_error_code(reason: str) -> str:
+    return {
+        "queue_full": "free_large_image_queue_full",
+        "handoff_full": "free_large_image_handoff_full",
+        "generation_busy": "free_large_image_generation_busy",
+        "queue_timeout": "free_large_image_queue_timeout",
+    }.get(reason, "free_large_image_busy")
+
+
 def _generate_single_image(
+        request: ConversationRequest,
+        index: int,
+        total: int,
+) -> list[ImageOutput]:
+    """Run one image generation. Large outputs admit before any upstream call.
+
+    The waiting slot is process-local and is not the per-account concurrency
+    limit. Polling an accepted async task does not enter this function again.
+    """
+    from services.free_large_image_guard import LargeImageAdmissionError, bind_large_image_job
+
+    try:
+        with bind_large_image_job(request.size):
+            return _generate_single_image_body(request, index, total)
+    except LargeImageAdmissionError as exc:
+        raise ImageGenerationError(
+            "Free-pool large-image capacity is busy. Retry this same request later; "
+            "do not start a duplicate generation.",
+            status_code=429,
+            error_type="rate_limit_error",
+            code=_admission_error_code(exc.reason),
+        ) from exc
+
+
+def _generate_single_image_body(
         request: ConversationRequest,
         index: int,
         total: int,
@@ -1297,6 +1388,8 @@ def _generate_single_image(
     该函数在独立线程中运行，每个线程使用不同的账号，
     实现并行生图，避免串行超时阻塞。
     """
+    from services.free_large_image_guard import LargeImageAdmissionError
+
     # 模型返回文本而非图片的最大重试次数
     MAX_TEXT_REPLY_RETRIES = 3
     # TLS 连接错误最大重试次数
@@ -1472,6 +1565,10 @@ def _generate_single_image(
                 "error": error_text,
                 "index": index,
             })
+            raise
+        except LargeImageAdmissionError:
+            # Slot was taken before the stream. Release it and do not start another generation.
+            account_service.mark_image_result(token, False)
             raise
         except Exception as exc:
             account_service.mark_image_result(token, False)

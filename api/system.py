@@ -58,6 +58,16 @@ class BackupDeleteRequest(BaseModel):
     key: str = ""
 
 
+def _free_large_image_guard_stats() -> dict[str, object]:
+    """Aggregate free-pool large-image counters. No prompts or credentials."""
+    try:
+        from services.free_large_image_guard import stats as guard_stats
+
+        return guard_stats()
+    except Exception:
+        return {"enabled": False, "scope": "process", "cross_process": False}
+
+
 def create_router(app_version: str) -> APIRouter:
     router = APIRouter()
 
@@ -308,6 +318,7 @@ def create_router(app_version: str) -> APIRouter:
             "storage": {"backend": storage.get_backend_info(), "health": storage_health},
             "proxy_runtime": proxy_settings.get_runtime_status(),
             "accounts": stats,
+            "free_large_image_guard": _free_large_image_guard_stats(),
         }
         if format == "json":
             return stats_json
