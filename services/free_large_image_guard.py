@@ -217,14 +217,24 @@ class Token:
         self.depth = 0
         self.stage = ""
         self.fail_reason = ""
+        self.owner_ident = 0
+
+    def _is_owner(self) -> bool:
+        return self.owner_ident != 0 and threading.get_ident() == self.owner_ident
 
     def owns_heavy_work(self) -> bool:
-        """True only while this thread has armed the permit and is inside it.
+        """True only while the arming thread is inside the permit.
 
         ``state == active`` also covers a slot another thread allocated and
-        this thread has not taken yet. That slot is not nested work.
+        this thread has not taken yet. Another thread that merely holds the
+        token object is not a nested enter.
         """
-        return self.state == "active" and self.work_running and self.depth >= 1
+        return (
+            self.state == "active"
+            and self.work_running
+            and self.depth >= 1
+            and self._is_owner()
+        )
 
     def cancel(self) -> bool:
         """Cancel a job that has not armed heavy work.
@@ -406,6 +416,8 @@ class Token:
         guard = self.guard
         deadline = time.monotonic() + max(0.0, timeout)
         with guard.cv:
+            if not self._is_owner():
+                raise LargeImageAdmissionError("foreign_thread")
             if self.state == "done":
                 raise LargeImageAdmissionError(self.fail_reason or "cancelled")
             if self.state == "active" and self.work_running:
@@ -463,6 +475,8 @@ class Token:
     def leave_heavy(self) -> None:
         guard = self.guard
         with guard.cv:
+            if not self._is_owner():
+                return
             if self.depth > 1:
                 self.depth -= 1
                 return
@@ -924,6 +938,7 @@ def _new_token(state: str) -> Token:
     token.id = _guard._next_id
     _guard._next_id += 1
     token.state = state
+    token.owner_ident = threading.get_ident()
     _guard.tokens[token.id] = token
     return token
 

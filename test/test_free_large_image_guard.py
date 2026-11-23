@@ -2048,12 +2048,127 @@ class PromotedOwnershipTests(GuardTestCase):
         self.assertFalse(errors, errors)
         self._assert_drained()
 
+    def test_foreign_thread_cannot_reenter_or_release(self) -> None:
+        release = threading.Event()
+        errors: list[BaseException] = []
+        shared: dict[str, guard.Token] = {}
+        bodies: list[int] = []
+        lock = threading.Lock()
+
+        def hold() -> None:
+            try:
+                with guard.heavy_image_work(declared_size="3840x2160", stage="owner") as token:
+                    assert token is not None
+                    with lock:
+                        bodies.append(threading.get_ident())
+                        shared.setdefault("token", token)
+                    release.wait(timeout=3)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        owners = [threading.Thread(target=hold, name=f"owner-{i}") for i in range(5)]
+        for thread in owners:
+            thread.start()
+        self.assertTrue(ConcurrencyTests._wait_until(
+            self, lambda: guard.stats()["active"] == 5 and len(bodies) == 5 and "token" in shared,
+        ))
+        token = shared["token"]
+        depth = token.depth
+        foreign_errors: list[BaseException] = []
+
+        def intrude() -> None:
+            try:
+                token.enter_heavy("foreign", 1)
+                with lock:
+                    bodies.append(threading.get_ident())
+            except LargeImageAdmissionError as exc:
+                foreign_errors.append(exc)
+            token.leave_heavy()
+
+        intruder = threading.Thread(target=intrude, name="foreign")
+        intruder.start()
+        intruder.join(timeout=2)
+        self.assertFalse(intruder.is_alive())
+        self.assertEqual([exc.reason for exc in foreign_errors], ["foreign_thread"])
+        self.assertEqual(token.depth, depth)
+        self.assertEqual(guard.stats()["active"], 5)
+        self.assertEqual(len(bodies), 5)
+        self.assertFalse(guard.cancel_token(token.id))
+        self.assertEqual(guard.stats()["active"], 5)
+        token.close()
+        self.assertEqual(guard.stats()["active"], 5)
+        self.assertTrue(token.work_running)
+        blocked = {"ran": False}
+
+        def sixth() -> None:
+            try:
+                with guard.heavy_image_work(declared_size="3840x2160", stage="sixth"):
+                    blocked["ran"] = True
+            except LargeImageAdmissionError:
+                return
+
+        guard.configure_limits(wait_timeout_secs=0.2)
+        extra = threading.Thread(target=sixth, name="sixth")
+        extra.start()
+        extra.join(timeout=2)
+        self.assertFalse(blocked["ran"])
+        self.assertEqual(guard.stats()["active"], 5)
+        release.set()
+        for thread in owners:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertFalse(errors, errors)
+        self._assert_drained()
+
+    def test_materialize_rejects_foreign_enter_and_drains(self) -> None:
+        seen: dict[str, object] = {}
+
+        def finish(raw: bytes, **_kwargs: object) -> dict[str, str]:
+            current = guard._current_token()
+            self.assertIsNotNone(current)
+            assert current is not None
+            self.assertTrue(current.owns_heavy_work())
+            active = guard.stats()["active"]
+            box: list[BaseException] = []
+
+            def intrude() -> None:
+                try:
+                    current.enter_heavy("foreign", 1)
+                except LargeImageAdmissionError as exc:
+                    box.append(exc)
+                current.leave_heavy()
+
+            intruder = threading.Thread(target=intrude)
+            intruder.start()
+            intruder.join(timeout=2)
+            self.assertFalse(intruder.is_alive())
+            self.assertEqual([exc.reason for exc in box], ["foreign_thread"])
+            self.assertEqual(guard.stats()["active"], active)
+            self.assertTrue(current.work_running)
+            seen["id"] = current.id
+            return {"url": "offline://out", "revised_prompt": "p", "unused": str(len(raw))}
+
+        from services.protocol.conversation import ConversationRequest, _materialize_image_output
+
+        request = ConversationRequest(model="gpt-image-2", prompt="p", size="2K", response_format="url")
+        with mock.patch("services.protocol.conversation._store_processed_image", finish):
+            output = _materialize_image_output(
+                _StreamingBackend(),
+                request,
+                ["offline://image"],
+                1,
+                1,
+                "offline",
+            )
+        self.assertIsNotNone(output)
+        self.assertFalse(self._snapshot_has(int(seen["id"])))
+        self._assert_drained()
+
     def _materialize_promoted_round(self, explode: bool) -> None:
         guard.configure_limits(wait_timeout_secs=3.0)
         holders = [guard._begin_heavy_waiter() for _ in range(4)]
         for token in holders:
             token.enter_heavy("held", 3)
-        producer = guard._begin_generation()
         promoted: list[guard.Token] = []
         seen: dict[str, object] = {}
         original = guard._begin_heavy_waiter
@@ -2065,6 +2180,7 @@ class PromotedOwnershipTests(GuardTestCase):
                 promoted.append(token)
 
                 def run_producer() -> None:
+                    producer = guard._begin_generation()
                     try:
                         producer.enter_heavy("other-generated", 3)
                         producer.leave_heavy()
@@ -2138,15 +2254,12 @@ class PromotedOwnershipTests(GuardTestCase):
                 token.close()
             for worker in producer_thread:
                 worker.join(timeout=3)
-            if not producer_thread:
-                producer.close()
 
     def _pipeline_two_covers_after_promotion(self) -> None:
         guard.configure_limits(wait_timeout_secs=3.0)
         holders = [guard._begin_heavy_waiter() for _ in range(4)]
         for token in holders:
             token.enter_heavy("held", 3)
-        producer = guard._begin_generation()
         promoted: list[guard.Token] = []
         original = guard._begin_heavy_waiter
         producer_thread: list[threading.Thread] = []
@@ -2157,6 +2270,7 @@ class PromotedOwnershipTests(GuardTestCase):
                 promoted.append(token)
 
                 def run_producer() -> None:
+                    producer = guard._begin_generation()
                     try:
                         producer.enter_heavy("other-generated", 3)
                         producer.leave_heavy()
@@ -2200,10 +2314,10 @@ class PromotedOwnershipTests(GuardTestCase):
         holders = [guard._begin_heavy_waiter() for _ in range(4)]
         for token in holders:
             token.enter_heavy("held", 3)
-        producer = guard._begin_generation()
         token = guard._begin_heavy_waiter()
 
         def run_producer() -> None:
+            producer = guard._begin_generation()
             try:
                 producer.enter_heavy("other-generated", 3)
                 producer.leave_heavy()
