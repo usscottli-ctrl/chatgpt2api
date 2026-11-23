@@ -26,20 +26,30 @@ and must not launch another generation.
 
 Defaults (free pool only):
 
-- active heavy stages: 5
-- jobs waiting to run or already admitted but not in a heavy stage: 10
-- admission / heavy-entry wait: 180s
+- ``active``: 5 jobs inside download, decode, upscale, or base64
+- ``heavy_waiting``: 10 jobs blocked immediately before that allocation
+- ``generating``: 20 upstream generations that have not reached the heavy queue
+- heavy-entry wait: 180s
+
+``generating`` is not the heavy queue. An upstream poll holds a thread and a
+small response stream, not a decoded frame. Its cap is four in-flight
+requests per heavy slot because the public API already limits ``n`` to 4, so
+each heavy slot can have one full batch upstream without retaining pixel
+buffers. Past that, admission returns ``generation_busy`` and does not call
+upstream.
+
+``queue_full`` is only the heavy queue: 10 jobs are already waiting to
+allocate and a new large request must not start. Ten generations with
+``active == 0`` do not fill that queue and must still be admitted.
 
 180s is one image download timeout (120s, see ``download_image_bytes``)
 plus the default poll timeout margin. 60s would expire while a permitted
-download is still inside its own 120s timeout. The shared upstream queue
-(100 slots / 30s) is a different process and is not modified here.
+download is still inside its own 120s timeout. Completed task payloads and
+the shared upstream queue (100 slots / 30s) are outside this process and
+are not modified here.
 
-``active + waiting`` counts large jobs only. 1K generations, health, and
-task polling do not take a slot. While 5 heavy stages are running, further
-large jobs hold a waiting slot and do not call upstream until a heavy
-stage finishes or the wait times out. That is intentionally narrower than
-"at most 5 large generations ever", and it is not Sub2 group #44.
+1K generations, health, and task polling do not take a slot. This is not a
+cap of 5 on every large generation, and it is not Sub2 group #44.
 """
 
 from __future__ import annotations
@@ -61,7 +71,12 @@ logger = logging.getLogger("chatgpt2api.free_large_image")
 # 2048*2048, 3840*2160, and 4096*4096 are above it. Equality is still small.
 LARGE_PIXEL_THRESHOLD = 1_700_000
 MAX_ACTIVE = 5
-MAX_WAITING = 10
+# Jobs blocked before download/decode. Two waves behind the 5 heavy slots.
+MAX_HEAVY_WAITING = 10
+MAX_WAITING = MAX_HEAVY_WAITING
+# Upstream generations. Four per heavy slot matches the API's n<=4 batch
+# without holding decoded frames. Not the heavy-memory queue.
+MAX_GENERATING = MAX_ACTIVE * 4
 # 120s download timeout + 60s for one wave of decode/upscale/base64.
 WAIT_TIMEOUT_SECS = 180
 # Header sniff budget. Stops well before a full 2K/4K buffer is assembled.
@@ -83,9 +98,9 @@ _tls = threading.local()
 class LargeImageAdmissionError(Exception):
     """Raised before a new upstream generation, or when heavy entry times out.
 
-    ``reason`` is one of ``queue_full``, ``queue_timeout``, ``cancelled``.
-    The message is metadata only. Callers must not start a replacement
-    generation for the same attempt.
+    ``reason`` is ``queue_full`` (heavy queue saturated), ``generation_busy``
+    (upstream cap), ``queue_timeout``, or ``cancelled``. Callers must not
+    start a replacement generation for the same attempt.
     """
 
     def __init__(self, reason: str) -> None:
@@ -99,19 +114,23 @@ class _Guard:
         self.enabled = False
         self.configured = False
         self.max_active = MAX_ACTIVE
-        self.max_waiting = MAX_WAITING
+        self.max_heavy_waiting = MAX_HEAVY_WAITING
+        self.max_generating = MAX_GENERATING
         self.wait_timeout_secs = WAIT_TIMEOUT_SECS
         self.threshold = LARGE_PIXEL_THRESHOLD
         self.active = 0
-        self.waiting = 0
+        self.heavy_waiting = 0
+        self.generating = 0
         self.rejected = 0
+        self.rejected_queue_full = 0
+        self.rejected_generation_busy = 0
         self.timed_out = 0
         self.cancelled = 0
         self.peak_active = 0
-        self.peak_waiting = 0
+        self.peak_heavy_waiting = 0
+        self.peak_generating = 0
         self._next_id = 1
         self.tokens: dict[int, Token] = {}
-        self.gen_queue: deque[Token] = deque()
         self.heavy_queue: deque[Token] = deque()
 
     def stats(self) -> dict[str, Any]:
@@ -121,16 +140,25 @@ class _Guard:
                 "scope": "process",
                 "cross_process": False,
                 "active": self.active,
-                "waiting": self.waiting,
                 "max_active": self.max_active,
-                "max_waiting": self.max_waiting,
+                "heavy_waiting": self.heavy_waiting,
+                "max_heavy_waiting": self.max_heavy_waiting,
+                # ``waiting`` is only the heavy queue, not upstream generation.
+                "waiting": self.heavy_waiting,
+                "max_waiting": self.max_heavy_waiting,
+                "generating": self.generating,
+                "max_generating": self.max_generating,
                 "wait_timeout_secs": self.wait_timeout_secs,
                 "threshold_pixels": self.threshold,
                 "rejected": self.rejected,
+                "rejected_queue_full": self.rejected_queue_full,
+                "rejected_generation_busy": self.rejected_generation_busy,
                 "timed_out": self.timed_out,
                 "cancelled": self.cancelled,
                 "peak_active": self.peak_active,
-                "peak_waiting": self.peak_waiting,
+                "peak_heavy_waiting": self.peak_heavy_waiting,
+                "peak_waiting": self.peak_heavy_waiting,
+                "peak_generating": self.peak_generating,
             }
 
     def reset(self, *, enabled: bool) -> None:
@@ -138,14 +166,17 @@ class _Guard:
             self.enabled = bool(enabled)
             self.configured = True
             self.active = 0
-            self.waiting = 0
+            self.heavy_waiting = 0
+            self.generating = 0
             self.rejected = 0
+            self.rejected_queue_full = 0
+            self.rejected_generation_busy = 0
             self.timed_out = 0
             self.cancelled = 0
             self.peak_active = 0
-            self.peak_waiting = 0
+            self.peak_heavy_waiting = 0
+            self.peak_generating = 0
             self.tokens.clear()
-            self.gen_queue.clear()
             self.heavy_queue.clear()
             self.cv.notify_all()
 
@@ -157,7 +188,8 @@ class Token:
     def __init__(self, guard: _Guard) -> None:
         self.guard = guard
         self.id = 0
-        self.state = "new"  # queued | reserved | active | done
+        # generating | heavy_waiting | active | admitted | done
+        self.state = "new"
         self.cancelled = False
         self.closed = False
         self.work_running = False
@@ -177,7 +209,7 @@ class Token:
             return True
 
     def close(self) -> None:
-        """Release a waiting slot. A running heavy section keeps its permit."""
+        """Release a generating or heavy-waiting reservation. Active work keeps its permit."""
         guard = self.guard
         with guard.cv:
             if self.state == "done" and not self.work_running:
@@ -186,60 +218,63 @@ class Token:
             self.closed = True
             if self.work_running or self.state == "active":
                 return
-            self._discard_waiting_locked()
+            self._release_reservation_locked()
             self.state = "done"
             guard.tokens.pop(self.id, None)
             guard.cv.notify_all()
 
-    def _discard_waiting_locked(self) -> None:
+    def _release_reservation_locked(self) -> None:
         guard = self.guard
-        if self in guard.gen_queue:
-            guard.gen_queue.remove(self)
         if self in guard.heavy_queue:
             guard.heavy_queue.remove(self)
-        if self.state in {"queued", "reserved"} and guard.waiting > 0:
-            guard.waiting -= 1
-        elif self.state in {"queued", "reserved"}:
-            guard.waiting = 0
+        if self.state == "generating" and guard.generating > 0:
+            guard.generating -= 1
+        elif self.state == "heavy_waiting" and guard.heavy_waiting > 0:
+            guard.heavy_waiting -= 1
 
-    def wait_generation_allowed(self, timeout: float) -> None:
-        """Block before upstream generation while every heavy slot is busy."""
+    def _join_heavy_waiting_locked(self, deadline: float) -> None:
+        """Count this job as a heavy waiter. Generation reservations are dropped first."""
         guard = self.guard
-        deadline = time.monotonic() + max(0.0, timeout)
-        with guard.cv:
-            while self.state == "queued":
-                if self.cancelled:
-                    guard.cancelled += 1
-                    raise LargeImageAdmissionError("cancelled")
-                head_ok = not guard.gen_queue or guard.gen_queue[0] is self
-                if guard.active < guard.max_active and head_ok:
-                    if guard.gen_queue and guard.gen_queue[0] is self:
-                        guard.gen_queue.popleft()
-                    self.state = "reserved"
-                    guard.cv.notify_all()
-                    return
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    guard.timed_out += 1
-                    logger.warning(
-                        "free_large_image admission timeout active=%s waiting=%s",
-                        guard.active,
-                        guard.waiting,
-                    )
-                    raise LargeImageAdmissionError("queue_timeout")
-                guard.cv.wait(remaining)
+        if self.state == "heavy_waiting":
+            return
+        if self.cancelled or self.state == "done":
+            guard.cancelled += 1
+            raise LargeImageAdmissionError("cancelled")
+        if self.state == "generating":
+            if guard.generating > 0:
+                guard.generating -= 1
+            self.state = "heavy_gate"
+        elif self.state == "admitted":
+            self.state = "heavy_gate"
+        elif self.state != "heavy_waiting":
+            guard.cancelled += 1
+            raise LargeImageAdmissionError("cancelled")
+        while self.state == "heavy_gate" and guard.heavy_waiting >= guard.max_heavy_waiting:
+            if self.cancelled:
+                guard.cancelled += 1
+                raise LargeImageAdmissionError("cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                guard.timed_out += 1
+                raise LargeImageAdmissionError("queue_timeout")
+            guard.cv.wait(remaining)
+        guard.heavy_waiting += 1
+        if guard.heavy_waiting > guard.peak_heavy_waiting:
+            guard.peak_heavy_waiting = guard.heavy_waiting
+        self.state = "heavy_waiting"
 
     def enter_heavy(self, stage: str, timeout: float) -> None:
         guard = self.guard
+        deadline = time.monotonic() + max(0.0, timeout)
         with guard.cv:
             if self.state == "active" and self.work_running:
                 self.depth += 1
                 return
-            if self.cancelled or self.state != "reserved":
+            if self.cancelled or self.state == "done":
                 guard.cancelled += 1
                 raise LargeImageAdmissionError("cancelled")
+            self._join_heavy_waiting_locked(deadline)
             guard.heavy_queue.append(self)
-            deadline = time.monotonic() + max(0.0, timeout)
             try:
                 while True:
                     if self.cancelled:
@@ -253,9 +288,10 @@ class Token:
                     if remaining <= 0:
                         guard.timed_out += 1
                         logger.warning(
-                            "free_large_image heavy-entry timeout active=%s waiting=%s stage=%s",
+                            "free_large_image heavy-entry timeout active=%s heavy_waiting=%s generating=%s stage=%s",
                             guard.active,
-                            guard.waiting,
+                            guard.heavy_waiting,
+                            guard.generating,
                             stage,
                         )
                         raise LargeImageAdmissionError("queue_timeout")
@@ -264,8 +300,8 @@ class Token:
                 if self in guard.heavy_queue:
                     guard.heavy_queue.remove(self)
                 raise
-            if guard.waiting > 0:
-                guard.waiting -= 1
+            if guard.heavy_waiting > 0:
+                guard.heavy_waiting -= 1
             guard.active += 1
             if guard.active > guard.peak_active:
                 guard.peak_active = guard.active
@@ -293,10 +329,9 @@ class Token:
                 self.state = "done"
                 guard.tokens.pop(self.id, None)
             else:
-                self.state = "reserved"
-                guard.waiting += 1
-                if guard.waiting > guard.peak_waiting:
-                    guard.peak_waiting = guard.waiting
+                # Heavy phase finished. Do not occupy the heavy queue while the
+                # caller still holds the request for a later phase or for close.
+                self.state = "admitted"
             guard.cv.notify_all()
 
 
@@ -342,14 +377,20 @@ def configure_limits(
     *,
     max_active: int | None = None,
     max_waiting: int | None = None,
+    max_heavy_waiting: int | None = None,
+    max_generating: int | None = None,
     wait_timeout_secs: float | None = None,
     threshold_pixels: int | None = None,
 ) -> None:
     with _guard.cv:
         if max_active is not None:
             _guard.max_active = max(1, int(max_active))
-        if max_waiting is not None:
-            _guard.max_waiting = max(0, int(max_waiting))
+        if max_heavy_waiting is not None:
+            _guard.max_heavy_waiting = max(0, int(max_heavy_waiting))
+        elif max_waiting is not None:
+            _guard.max_heavy_waiting = max(0, int(max_waiting))
+        if max_generating is not None:
+            _guard.max_generating = max(1, int(max_generating))
         if wait_timeout_secs is not None:
             _guard.wait_timeout_secs = max(0.0, float(wait_timeout_secs))
         if threshold_pixels is not None:
@@ -359,7 +400,8 @@ def configure_limits(
 def reset_for_tests(*, enabled: bool = False) -> None:
     _guard.reset(enabled=enabled)
     _guard.max_active = MAX_ACTIVE
-    _guard.max_waiting = MAX_WAITING
+    _guard.max_heavy_waiting = MAX_HEAVY_WAITING
+    _guard.max_generating = MAX_GENERATING
     _guard.wait_timeout_secs = WAIT_TIMEOUT_SECS
     _guard.threshold = LARGE_PIXEL_THRESHOLD
     stack = getattr(_tls, "stack", None)
@@ -721,52 +763,71 @@ def _pop_token(token: Token) -> None:
         stack.remove(token)
 
 
-def _acquire_before_generation() -> Token:
-    timeout = _guard.wait_timeout_secs
-    with _guard.cv:
-        if _guard.waiting >= _guard.max_waiting:
-            _guard.rejected += 1
-            logger.warning(
-                "free_large_image queue full active=%s waiting=%s max_waiting=%s",
-                _guard.active,
-                _guard.waiting,
-                _guard.max_waiting,
-            )
-            raise LargeImageAdmissionError("queue_full")
-        _guard.waiting += 1
-        if _guard.waiting > _guard.peak_waiting:
-            _guard.peak_waiting = _guard.waiting
-        token = Token(_guard)
-        token.id = _guard._next_id
-        _guard._next_id += 1
-        token.state = "queued"
-        _guard.tokens[token.id] = token
-        _guard.gen_queue.append(token)
-    try:
-        token.wait_generation_allowed(timeout)
-    except BaseException:
-        token.close()
-        raise
+def _new_token(state: str) -> Token:
+    token = Token(_guard)
+    token.id = _guard._next_id
+    _guard._next_id += 1
+    token.state = state
+    _guard.tokens[token.id] = token
     return token
+
+
+def _reject(reason: str) -> None:
+    _guard.rejected += 1
+    if reason == "queue_full":
+        _guard.rejected_queue_full += 1
+    elif reason == "generation_busy":
+        _guard.rejected_generation_busy += 1
+    logger.warning(
+        "free_large_image reject reason=%s active=%s heavy_waiting=%s generating=%s",
+        reason,
+        _guard.active,
+        _guard.heavy_waiting,
+        _guard.generating,
+    )
+    raise LargeImageAdmissionError(reason)
+
+
+def _begin_generation() -> Token:
+    """Count an upstream large-image generation. Does not take a heavy slot."""
+    with _guard.cv:
+        if _guard.heavy_waiting >= _guard.max_heavy_waiting:
+            _reject("queue_full")
+        if _guard.generating >= _guard.max_generating:
+            _reject("generation_busy")
+        _guard.generating += 1
+        if _guard.generating > _guard.peak_generating:
+            _guard.peak_generating = _guard.generating
+        return _new_token("generating")
+
+
+def _begin_heavy_waiter() -> Token:
+    """Count a job whose next step is the heavy allocation."""
+    with _guard.cv:
+        if _guard.heavy_waiting >= _guard.max_heavy_waiting:
+            _reject("queue_full")
+        _guard.heavy_waiting += 1
+        if _guard.heavy_waiting > _guard.peak_heavy_waiting:
+            _guard.peak_heavy_waiting = _guard.heavy_waiting
+        return _new_token("heavy_waiting")
 
 
 @contextmanager
 def bind_large_image_job(size: object) -> Iterator[Token | None]:
-    """Reserve a large-output job before upstream generation.
+    """Admit one large-output generation before the upstream call.
 
-    No-op for small sizes and when the guard is disabled. When every heavy
-    slot is busy, this waits (bounded) and only then lets the caller start
-    upstream work. Queue overflow and timeout raise ``LargeImageAdmissionError``
-    without yielding.
+    This reserves a generating slot, not a heavy-memory slot. A full heavy
+    queue refuses admission. A full generating cap refuses admission. Neither
+    starts upstream work. Small sizes and a disabled guard are no-ops.
     """
     if not is_enabled() or not is_large_size(size):
         yield None
         return
     current = _current_token()
-    if current is not None and current.state in {"queued", "reserved", "active"}:
+    if current is not None and current.state in {"generating", "heavy_waiting", "active", "admitted"}:
         yield current
         return
-    token = _acquire_before_generation()
+    token = _begin_generation()
     _push_token(token)
     try:
         yield token
@@ -801,8 +862,8 @@ class _HeavyPipeline:
             return
         if self.token is None:
             current = _current_token()
-            if current is None or current.state not in {"queued", "reserved", "active"}:
-                current = _acquire_before_generation()
+            if current is None or current.state not in {"generating", "heavy_waiting", "active", "admitted"}:
+                current = _begin_heavy_waiter()
                 self.owned = True
                 _push_token(current)
             self.token = current
@@ -908,8 +969,8 @@ def heavy_image_work(
         return
     token = _current_token()
     owned = False
-    if token is None or token.state not in {"queued", "reserved", "active"}:
-        token = _acquire_before_generation()
+    if token is None or token.state not in {"generating", "heavy_waiting", "active", "admitted"}:
+        token = _begin_heavy_waiter()
         owned = True
         _push_token(token)
     try:

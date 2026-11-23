@@ -1344,6 +1344,14 @@ def stream_codex_image_outputs(
     raise ImageGenerationError("No image result found in response")
 
 
+def _admission_error_code(reason: str) -> str:
+    return {
+        "queue_full": "free_large_image_queue_full",
+        "generation_busy": "free_large_image_generation_busy",
+        "queue_timeout": "free_large_image_queue_timeout",
+    }.get(reason, "free_large_image_busy")
+
+
 def _generate_single_image(
         request: ConversationRequest,
         index: int,
@@ -1365,7 +1373,7 @@ def _generate_single_image(
             "do not start a duplicate generation.",
             status_code=429,
             error_type="rate_limit_error",
-            code="free_large_image_busy",
+            code=_admission_error_code(exc.reason),
         ) from exc
 
 

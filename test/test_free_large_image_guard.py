@@ -220,10 +220,15 @@ class ConcurrencyTests(GuardTestCase):
         for thread in holders:
             thread.start()
         self.assertTrue(self._wait_until(lambda: guard.stats()["active"] == 5))
+        # Five heavy jobs do not block a new upstream generation.
+        with guard.bind_large_image_job("4K"):
+            self.assertEqual(guard.stats()["generating"], 1)
+            self.assertEqual(guard.stats()["heavy_waiting"], 0)
+        self.assertEqual(guard.stats()["generating"], 0)
         guard.configure_limits(wait_timeout_secs=0.2)
         started = time.time()
         with self.assertRaises(LargeImageAdmissionError) as timed:
-            with guard.bind_large_image_job("4K"):
+            with guard.heavy_image_work(declared_size="4K", stage="heavy-timeout"):
                 entered.append(1)
         self.assertEqual(timed.exception.reason, "queue_timeout")
         self.assertLess(time.time() - started, 1.5)
@@ -286,7 +291,7 @@ class ConcurrencyTests(GuardTestCase):
         deadline = time.time() + 2
         while time.time() < deadline and token_id is None:
             for item in guard.token_snapshot():
-                if item["state"] == "queued":
+                if item["state"] == "heavy_waiting":
                     token_id = item["id"]
                     break
             time.sleep(0.01)
@@ -516,8 +521,9 @@ class IntegrationTests(GuardTestCase):
             worker = threading.Thread(target=run_one, name="acct-b")
             worker.start()
             time.sleep(0.1)
-            self.assertEqual(calls["token"], 0)
-            self.assertEqual(calls["stream"], 0)
+            # Heavy memory being full does not by itself block upstream admission.
+            self.assertEqual(calls["token"], 1)
+            self.assertEqual(calls["stream"], 1)
             self.assertFalse(worker_done.is_set())
             release.set()
             self.assertTrue(worker_done.wait(timeout=3))
@@ -543,7 +549,7 @@ class IntegrationTests(GuardTestCase):
                         1,
                     )
             self.assertEqual(caught.exception.status_code, 429)
-            self.assertEqual(caught.exception.code, "free_large_image_busy")
+            self.assertEqual(caught.exception.code, "free_large_image_queue_timeout")
             self.assertEqual(calls["stream"], 1)
             self.assertEqual(calls["token"], 1)
 
@@ -843,11 +849,129 @@ class IntegrationTests(GuardTestCase):
         self.assertEqual(section["max_active"], 5)
         self.assertIn("active", section)
         self.assertIn("waiting", section)
+        self.assertIn("heavy_waiting", section)
+        self.assertIn("generating", section)
+        self.assertEqual(section["waiting"], section["heavy_waiting"])
         self.assertIn("rejected", section)
         self.assertIn("peak_active", section)
         self.assertNotIn("prompt", section)
         self.assertNotIn("authorization", section)
         self.assertFalse(section["cross_process"])
+
+
+class GenerationQueueTests(GuardTestCase):
+    """Upstream generation must not consume the heavy-memory queue."""
+
+    def test_ten_generations_with_idle_heavy_still_admit(self) -> None:
+        release = threading.Event()
+        started = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def occupy() -> None:
+            try:
+                with guard.bind_large_image_job("2048x2048"):
+                    with lock:
+                        started.append(1)
+                    release.wait(timeout=3)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=occupy, name=f"gen-{i}") for i in range(10)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: len(started) == 10))
+        stats = guard.stats()
+        self.assertEqual(stats["generating"], 10)
+        self.assertEqual(stats["heavy_waiting"], 0)
+        self.assertEqual(stats["waiting"], 0)
+        self.assertEqual(stats["active"], 0)
+        self.assertEqual(stats["rejected"], 0)
+        with guard.bind_large_image_job("3840x2160") as token:
+            self.assertIsNotNone(token)
+            self.assertEqual(guard.stats()["generating"], 11)
+            self.assertEqual(guard.stats()["active"], 0)
+            self.assertEqual(guard.stats()["heavy_waiting"], 0)
+        guard.configure_limits(max_generating=10)
+        calls = {"body": 0}
+        with self.assertRaises(LargeImageAdmissionError) as busy:
+            with guard.bind_large_image_job("4K"):
+                calls["body"] += 1
+        self.assertEqual(busy.exception.reason, "generation_busy")
+        self.assertEqual(calls["body"], 0)
+        self.assertEqual(guard.stats()["rejected_generation_busy"], 1)
+        self.assertEqual(guard.stats()["generating"], 10)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual(guard.stats()["generating"], 0)
+        self.assertEqual(guard.stats()["heavy_waiting"], 0)
+
+    def test_saturated_heavy_queue_rejects_before_upstream(self) -> None:
+        release = threading.Event()
+        entered: list[int] = []
+        errors: list[BaseException] = []
+        holders = [
+            threading.Thread(target=self._hold, args=(release, entered, errors), name=f"heavy-{i}")
+            for i in range(5)
+        ]
+        for thread in holders:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["active"] == 5))
+
+        def waiter() -> None:
+            try:
+                with guard.heavy_image_work(declared_size="2048x2048", stage="queue"):
+                    entered.append(1)
+                    release.wait(timeout=3)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        waiters = [threading.Thread(target=waiter, name=f"wait-{i}") for i in range(10)]
+        for thread in waiters:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["heavy_waiting"] == 10))
+        calls = {"body": 0}
+
+        def upstream() -> None:
+            calls["body"] += 1
+
+        with self.assertRaises(LargeImageAdmissionError) as caught:
+            with guard.bind_large_image_job("4K"):
+                upstream()
+        self.assertEqual(caught.exception.reason, "queue_full")
+        self.assertEqual(calls["body"], 0)
+        self.assertEqual(guard.stats()["generating"], 0)
+        self.assertEqual(guard.stats()["active"], 5)
+        self.assertEqual(guard.stats()["heavy_waiting"], 10)
+        release.set()
+        for thread in holders + waiters:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual(guard.stats()["generating"], 0)
+        self.assertEqual(guard.stats()["heavy_waiting"], 0)
+        self.assertEqual(guard.stats()["active"], 0)
+
+    def test_failed_generation_releases_reservation(self) -> None:
+        with self.assertRaises(RuntimeError):
+            with guard.bind_large_image_job("2K"):
+                self.assertEqual(guard.stats()["generating"], 1)
+                self.assertEqual(guard.stats()["heavy_waiting"], 0)
+                raise RuntimeError("upstream failed")
+        self.assertEqual(guard.stats()["generating"], 0)
+        self.assertEqual(guard.stats()["heavy_waiting"], 0)
+        self.assertEqual(guard.stats()["active"], 0)
+        with guard.bind_large_image_job("2K"):
+            self.assertEqual(guard.stats()["generating"], 1)
+
+    def _hold(self, release: threading.Event, entered: list[int], errors: list[BaseException]) -> None:
+        ConcurrencyTests._hold_heavy(self, release, entered, errors)
+
+    def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
+        return ConcurrencyTests._wait_until(self, predicate, timeout)
 
 
 class DiscoveredSizePipelineTests(GuardTestCase):
@@ -972,7 +1096,7 @@ class DiscoveredSizePipelineTests(GuardTestCase):
             deadline = time.time() + 2
             while time.time() < deadline and token_id is None:
                 for item in guard.token_snapshot():
-                    if item["state"] == "queued":
+                    if item["state"] == "heavy_waiting":
                         token_id = item["id"]
                         break
                 time.sleep(0.01)
