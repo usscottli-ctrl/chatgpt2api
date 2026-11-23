@@ -218,32 +218,70 @@ class Token:
         self.stage = ""
         self.fail_reason = ""
 
+    def owns_heavy_work(self) -> bool:
+        """True only while this thread has armed the permit and is inside it.
+
+        ``state == active`` also covers a slot another thread allocated and
+        this thread has not taken yet. That slot is not nested work.
+        """
+        return self.state == "active" and self.work_running and self.depth >= 1
+
     def cancel(self) -> bool:
-        """Cancel a job that has not entered heavy work. Never drops an active permit."""
+        """Cancel a job that has not armed heavy work.
+
+        An armed permit stays with the thread that is inside it. A slot that
+        was only allocated, and not armed, is released here.
+        """
         guard = self.guard
         with guard.cv:
-            if self.work_running or self.state == "active":
+            if self.work_running:
                 return False
             if self.state == "done":
                 return False
             self.cancelled = True
+            if self.state == "active":
+                self._release_allocated_active_locked("cancelled")
+                return True
             guard.cv.notify_all()
             return True
 
     def close(self) -> None:
-        """Release a generating or heavy-waiting reservation. Active work keeps its permit."""
+        """Release a claim this thread is not currently inside.
+
+        Armed work keeps the permit until ``leave_heavy``. An active slot that
+        was never armed is not running work, so close releases it.
+        """
         guard = self.guard
         with guard.cv:
-            if self.state == "done" and not self.work_running:
+            if self.state == "done":
                 guard.tokens.pop(self.id, None)
                 return
             self.closed = True
-            if self.work_running or self.state == "active":
+            if self.work_running:
+                return
+            if self.state == "active":
+                self._release_allocated_active_locked("")
                 return
             self._release_reservation_locked()
             self.state = "done"
             guard.tokens.pop(self.id, None)
             guard.cv.notify_all()
+
+    def _release_allocated_active_locked(self, reason: str) -> None:
+        """Drop a heavy slot that no thread has armed."""
+        guard = self.guard
+        if self.work_running or self.state != "active":
+            return
+        if guard.active > 0:
+            guard.active -= 1
+        if reason == "cancelled":
+            guard.cancelled += 1
+            self.fail_reason = reason
+        self.work_running = False
+        self.depth = 0
+        self.state = "done"
+        guard.tokens.pop(self.id, None)
+        guard.cv.notify_all()
 
     def _release_reservation_locked(self) -> None:
         guard = self.guard
@@ -368,13 +406,20 @@ class Token:
         guard = self.guard
         deadline = time.monotonic() + max(0.0, timeout)
         with guard.cv:
-            if self._arm_active_locked():
-                return
             if self.state == "done":
                 raise LargeImageAdmissionError(self.fail_reason or "cancelled")
-            if self.cancelled:
+            if self.state == "active" and self.work_running:
+                self.depth += 1
+                return
+            if self.cancelled and not self.work_running:
                 self._abandon_locked("cancelled")
                 raise LargeImageAdmissionError("cancelled")
+            if self.state == "active":
+                # The slot is already allocated to this token. Arm it now.
+                self.stage = stage or self.stage
+                self.work_running = True
+                self.depth = 1
+                return
             self.stage = stage
             try:
                 while self.state != "active":
@@ -960,6 +1005,11 @@ def consistency() -> str | None:
             return f"heavy_waiting counter tokens={counts['heavy_waiting']} counter={_guard.heavy_waiting}"
         if counts["active"] != _guard.active:
             return f"active counter tokens={counts['active']} counter={_guard.active}"
+        for token in _guard.tokens.values():
+            if token.state == "done":
+                return "done token retained"
+            if token.closed and not token.work_running:
+                return "closed idle token"
         queued = [token for token in _guard.heavy_queue if token.state != "heavy_waiting"]
         if queued:
             return "queue holds " + queued[0].state
@@ -1037,12 +1087,15 @@ class _HeavyPipeline:
                 self.owned = True
                 _push_token(current)
             self.token = current
-        if self.token.state != "active":
+        if self.token.owns_heavy_work():
+            # This thread already armed the permit. A later cover must not
+            # take another slot or leave the outer one.
+            self.entered = False
+        else:
+            # Active-but-unarmed means another thread allocated the slot.
+            # This thread still has to arm it, and release() has to leave it.
             self.token.enter_heavy(stage or self.stage, _guard.wait_timeout_secs)
             self.entered = True
-        else:
-            # Already inside this thread's heavy section. Do not take a second slot.
-            self.entered = False
 
     def release(self) -> None:
         token = self.token

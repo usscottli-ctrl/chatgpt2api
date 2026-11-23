@@ -1862,7 +1862,7 @@ class HandoffConservationTests(GuardTestCase):
         self.assertEqual(guard.stats()["generating"], 0)
 
     def test_seeded_schedules_match_token_states(self) -> None:
-        for seed in (1, 2, 3, 7, 11, 19, 23, 42):
+        for seed in range(64):
             with self.subTest(seed=seed):
                 reset_for_tests(enabled=True)
                 guard.configure_limits(max_active=5, max_waiting=10, wait_timeout_secs=3.0)
@@ -1871,6 +1871,7 @@ class HandoffConservationTests(GuardTestCase):
                 self.assertEqual(stats["active"], 0, stats)
                 self.assertEqual(stats["heavy_waiting"], 0, stats)
                 self.assertEqual(stats["generating"], 0, stats)
+                self.assertEqual(guard.token_snapshot(), [], guard.token_snapshot())
                 self.assertIsNone(guard.consistency(), stats)
 
     def _run_seed(self, seed: int) -> None:
@@ -1890,8 +1891,17 @@ class HandoffConservationTests(GuardTestCase):
             local = random.Random(seed * 1000 + index)
             entered_body = False
             try:
-                time.sleep(local.random() * 0.01)
-                if local.randrange(3) == 0:
+                time.sleep(local.random() * 0.005)
+                roll = local.randrange(5)
+                if roll == 0:
+                    with guard.heavy_image_pipeline(declared_size="2K") as pipe:
+                        entered_body = True
+                        if pipe is not None:
+                            pipe.cover(3_840 * 2_160, stage="base64")
+                        if local.random() < 0.15:
+                            raise RuntimeError("decode")
+                        time.sleep(local.random() * 0.004)
+                elif roll == 1:
                     with guard.bind_large_image_job("3840x2160"):
                         entered_body = True
                         time.sleep(local.random() * 0.004)
@@ -1941,6 +1951,7 @@ class HandoffConservationTests(GuardTestCase):
             stats["rejected"],
             stats["rejected_queue_full"] + stats["rejected_generation_busy"] + stats["rejected_handoff_full"],
         )
+        self.assertEqual(guard.token_snapshot(), [], guard.token_snapshot())
 
     def _park_heavy(self, release: threading.Event, errors: list[BaseException]) -> None:
         try:
@@ -1948,6 +1959,290 @@ class HandoffConservationTests(GuardTestCase):
                 release.wait(timeout=5)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
+
+    def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
+        return ConcurrencyTests._wait_until(self, predicate, timeout)
+
+
+class PromotedOwnershipTests(GuardTestCase):
+    """A promoted slot is allocated, not owned, until this thread arms it."""
+
+    def test_materialize_promotion_leaves_no_token(self) -> None:
+        for _ in range(5):
+            self._materialize_promoted_round(explode=False)
+            self._assert_drained()
+        with guard.heavy_image_work(declared_size="2K", stage="after-rounds"):
+            self.assertEqual(guard.stats()["active"], 1)
+        self._assert_drained()
+
+    def test_materialize_exception_and_second_cover_release_the_slot(self) -> None:
+        self._materialize_promoted_round(explode=True)
+        self._assert_drained()
+        self._pipeline_two_covers_after_promotion()
+        self._assert_drained()
+
+    def test_cancel_close_and_timeout_around_promotion(self) -> None:
+        waiting = guard._begin_heavy_waiter()
+        self.assertTrue(guard.cancel_token(waiting.id))
+        with self.assertRaises(LargeImageAdmissionError) as cancelled:
+            waiting.enter_heavy("held", 1)
+        self.assertEqual(cancelled.exception.reason, "cancelled")
+        waiting.close()
+        self._assert_drained()
+
+        token, holders, thread = self._promote_without_arming()
+        try:
+            self.assertEqual(token.state, "active")
+            self.assertFalse(token.work_running)
+            self.assertEqual(token.depth, 0)
+            self.assertTrue(guard.cancel_token(token.id))
+            self.assertNotEqual(token.state, "active")
+            self.assertFalse(self._snapshot_has(token.id))
+            with self.assertRaises(LargeImageAdmissionError):
+                token.enter_heavy("held", 1)
+        finally:
+            self._release_promotion(holders, thread)
+        self._assert_drained()
+
+        token, holders, thread = self._promote_without_arming()
+        try:
+            token.close()
+            self.assertFalse(token.work_running)
+            self.assertFalse(self._snapshot_has(token.id))
+            self.assertNotEqual(token.state, "active")
+        finally:
+            self._release_promotion(holders, thread)
+        self._assert_drained()
+
+        token, holders, thread = self._promote_without_arming()
+        try:
+            token.enter_heavy("download", 0.05)
+            self.assertTrue(token.work_running)
+            self.assertGreaterEqual(token.depth, 1)
+            token.leave_heavy()
+            token.close()
+            self.assertFalse(self._snapshot_has(token.id))
+        finally:
+            self._release_promotion(holders, thread)
+        self._assert_drained()
+
+        release = threading.Event()
+        errors: list[BaseException] = []
+        holders = [
+            threading.Thread(target=self._park, args=(release, errors), name=f"full-{i}")
+            for i in range(5)
+        ]
+        for holder in holders:
+            holder.start()
+        self.assertTrue(ConcurrencyTests._wait_until(self, lambda: guard.stats()["active"] == 5))
+        blocked = guard._begin_heavy_waiter()
+        with self.assertRaises(LargeImageAdmissionError) as timed:
+            blocked.enter_heavy("queued", 0.2)
+        self.assertEqual(timed.exception.reason, "queue_timeout")
+        blocked.close()
+        self.assertFalse(self._snapshot_has(blocked.id))
+        self.assertEqual(guard.stats()["rejected"], 0)
+        release.set()
+        for holder in holders:
+            holder.join(timeout=3)
+        self.assertFalse(errors, errors)
+        self._assert_drained()
+
+    def _materialize_promoted_round(self, explode: bool) -> None:
+        guard.configure_limits(wait_timeout_secs=3.0)
+        holders = [guard._begin_heavy_waiter() for _ in range(4)]
+        for token in holders:
+            token.enter_heavy("held", 3)
+        producer = guard._begin_generation()
+        promoted: list[guard.Token] = []
+        seen: dict[str, object] = {}
+        original = guard._begin_heavy_waiter
+        producer_thread: list[threading.Thread] = []
+
+        def pause_after_admission() -> guard.Token:
+            token = original()
+            if not promoted:
+                promoted.append(token)
+
+                def run_producer() -> None:
+                    try:
+                        producer.enter_heavy("other-generated", 3)
+                        producer.leave_heavy()
+                    finally:
+                        producer.close()
+
+                worker = threading.Thread(target=run_producer, name="producer")
+                producer_thread.append(worker)
+                worker.start()
+                deadline = time.time() + 2
+                while time.time() < deadline and not (
+                    token.state == "active" and not token.work_running and token.depth == 0
+                ):
+                    time.sleep(0.001)
+                if not (token.state == "active" and not token.work_running and token.depth == 0):
+                    raise AssertionError(f"promotion did not land unarmed: {token.state}")
+            return token
+
+        def finish(raw: bytes, **_kwargs: object) -> dict[str, str]:
+            current = guard._current_token()
+            self.assertIsNotNone(current)
+            assert current is not None
+            seen["state"] = current.state
+            seen["work_running"] = current.work_running
+            seen["depth"] = current.depth
+            seen["id"] = current.id
+            if explode:
+                raise RuntimeError("finish failed")
+            return {"url": "offline://out", "revised_prompt": "p", "unused": str(len(raw))}
+
+        guard._begin_heavy_waiter = pause_after_admission  # type: ignore[method-assign]
+        try:
+            from services.protocol.conversation import ConversationRequest, _materialize_image_output
+
+            request = ConversationRequest(
+                model="gpt-image-2",
+                prompt="p",
+                size=None,
+                response_format="url",
+            )
+            with mock.patch("services.protocol.conversation._store_processed_image", finish):
+                if explode:
+                    with self.assertRaises(RuntimeError):
+                        _materialize_image_output(
+                            _StreamingBackend(),
+                            request,
+                            ["offline://image"],
+                            1,
+                            1,
+                            "offline",
+                        )
+                else:
+                    output = _materialize_image_output(
+                        _StreamingBackend(),
+                        request,
+                        ["offline://image"],
+                        1,
+                        1,
+                        "offline",
+                    )
+                    self.assertIsNotNone(output)
+            self.assertTrue(promoted)
+            self.assertEqual(seen.get("state"), "active")
+            self.assertTrue(seen.get("work_running"))
+            self.assertGreaterEqual(int(seen.get("depth") or 0), 1)
+            self.assertFalse(self._snapshot_has(promoted[0].id))
+        finally:
+            guard._begin_heavy_waiter = original  # type: ignore[method-assign]
+            for token in holders:
+                token.leave_heavy()
+                token.close()
+            for worker in producer_thread:
+                worker.join(timeout=3)
+            if not producer_thread:
+                producer.close()
+
+    def _pipeline_two_covers_after_promotion(self) -> None:
+        guard.configure_limits(wait_timeout_secs=3.0)
+        holders = [guard._begin_heavy_waiter() for _ in range(4)]
+        for token in holders:
+            token.enter_heavy("held", 3)
+        producer = guard._begin_generation()
+        promoted: list[guard.Token] = []
+        original = guard._begin_heavy_waiter
+        producer_thread: list[threading.Thread] = []
+
+        def pause_after_admission() -> guard.Token:
+            token = original()
+            if not promoted:
+                promoted.append(token)
+
+                def run_producer() -> None:
+                    try:
+                        producer.enter_heavy("other-generated", 3)
+                        producer.leave_heavy()
+                    finally:
+                        producer.close()
+
+                worker = threading.Thread(target=run_producer, name="producer-cover")
+                producer_thread.append(worker)
+                worker.start()
+                deadline = time.time() + 2
+                while time.time() < deadline and token.state != "active":
+                    time.sleep(0.001)
+            return token
+
+        guard._begin_heavy_waiter = pause_after_admission  # type: ignore[method-assign]
+        try:
+            with guard.heavy_image_pipeline(declared_size="2K", stage="download_decode") as pipe:
+                self.assertIsNotNone(pipe)
+                assert pipe is not None
+                first = pipe.token
+                self.assertIsNotNone(first)
+                assert first is not None
+                self.assertTrue(first.owns_heavy_work())
+                self.assertEqual(guard.stats()["active"], 5)
+                pipe.cover(3_840 * 2_160, stage="base64")
+                self.assertIs(pipe.token, first)
+                self.assertEqual(guard.stats()["active"], 5)
+                self.assertTrue(first.owns_heavy_work())
+            self.assertTrue(promoted)
+            self.assertFalse(self._snapshot_has(promoted[0].id))
+        finally:
+            guard._begin_heavy_waiter = original  # type: ignore[method-assign]
+            for token in holders:
+                token.leave_heavy()
+                token.close()
+            for worker in producer_thread:
+                worker.join(timeout=3)
+
+    def _promote_without_arming(self) -> tuple[guard.Token, list[guard.Token], threading.Thread]:
+        guard.configure_limits(wait_timeout_secs=3.0)
+        holders = [guard._begin_heavy_waiter() for _ in range(4)]
+        for token in holders:
+            token.enter_heavy("held", 3)
+        producer = guard._begin_generation()
+        token = guard._begin_heavy_waiter()
+
+        def run_producer() -> None:
+            try:
+                producer.enter_heavy("other-generated", 3)
+                producer.leave_heavy()
+            finally:
+                producer.close()
+
+        worker = threading.Thread(target=run_producer, name="promote")
+        worker.start()
+        self.assertTrue(
+            ConcurrencyTests._wait_until(
+                self,
+                lambda: token.state == "active" and not token.work_running and token.depth == 0,
+            )
+        )
+        return token, holders, worker
+
+    def _release_promotion(self, holders: list[guard.Token], worker: threading.Thread) -> None:
+        for token in holders:
+            if token.state == "active":
+                token.leave_heavy()
+            token.close()
+        worker.join(timeout=3)
+
+    def _park(self, release: threading.Event, errors: list[BaseException]) -> None:
+        try:
+            with guard.heavy_image_work(declared_size="3840x2160", stage="park"):
+                release.wait(timeout=3)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def _snapshot_has(self, token_id: int) -> bool:
+        return any(item["id"] == token_id for item in guard.token_snapshot())
+
+    def _assert_drained(self) -> None:
+        self.assertEqual(guard.stats()["active"], 0, guard.stats())
+        self.assertEqual(guard.stats()["heavy_waiting"], 0, guard.stats())
+        self.assertEqual(guard.stats()["generating"], 0, guard.stats())
+        self.assertEqual(guard.token_snapshot(), [], guard.token_snapshot())
+        self.assertIsNone(guard.consistency(), guard.stats())
 
     def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
         return ConcurrencyTests._wait_until(self, predicate, timeout)
