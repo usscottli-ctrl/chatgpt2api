@@ -1071,6 +1071,11 @@ def reset_request_cancel(token: contextvars.Token) -> None:
     _request_cancel.reset(token)
 
 
+def request_cancel_is_set() -> bool:
+    """True when the inbound HTTP request has been cancelled or disconnected."""
+    return _request_cancel_is_set()
+
+
 def _request_cancel_is_set() -> bool:
     """True when the inbound image request has been cancelled or disconnected.
 
@@ -1094,27 +1099,6 @@ def raise_if_request_cancelled() -> None:
     with _guard.cv:
         _guard.cancelled += 1
     raise LargeImageAdmissionError("cancelled")
-
-
-_edit_prepare: contextvars.ContextVar[Any] = contextvars.ContextVar(
-    "free_large_image_edit_prepare",
-    default=None,
-)
-
-
-def bind_edit_prepare(callback: Any) -> contextvars.Token:
-    """Run ``callback`` once inside the child claim, before upstream."""
-    return _edit_prepare.set(callback)
-
-
-def reset_edit_prepare(token: contextvars.Token) -> None:
-    _edit_prepare.reset(token)
-
-
-def run_edit_prepare() -> None:
-    callback = _edit_prepare.get()
-    if callback is not None:
-        callback()
 
 
 class EditBufferHold:
@@ -1264,40 +1248,132 @@ def png_rgba_upper_bound(width: int, height: int, extra: int = 0) -> int:
     return rows + 65536 + (12 * idat_chunks) + extra
 
 
-def icc_chunk_upper_bound(profile: bytes) -> int:
-    """PNG iCCP chunk Pillow writes for a profile of this length."""
-    zipped = _zlib_compress_bound(len(profile))
+# Pillow's PNG reader refuses an inflated iCCP above ImageFile.SAFEBLOCK.
+PNG_PROFILE_ACCEPT_BYTES = 1024 * 1024
+
+
+def icc_chunk_upper_bound(profile_len: int) -> int:
+    """PNG iCCP chunk Pillow writes for a profile of this length. No inflate."""
+    zipped = _zlib_compress_bound(int(profile_len))
     return 12 + len(b"ICC Profile") + 2 + zipped
 
 
 def png_ancillary_upper_bound(data: bytes) -> int:
-    """Ancillary bytes Pillow will copy out of this PNG, chiefly iCCP."""
+    """Reserve for an iCCP Pillow may copy. Reads chunk lengths only.
+
+    A compressed profile is not inflated here. Any iCCP Pillow can still
+    accept reserves ``PNG_PROFILE_ACCEPT_BYTES`` of output. A larger
+    compressed chunk cannot survive Pillow's reader, so it adds nothing.
+    """
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         return 0
-    import zlib
-
     index = 8
     extra = 0
-    while index + 8 <= len(data):
+    while index + 12 <= len(data):
         length = int.from_bytes(data[index:index + 4], "big")
         kind = data[index + 4:index + 8]
-        start = index + 8
-        chunk = data[start:start + length]
-        index = start + length + 4
-        if kind == b"iCCP" and len(chunk) > 2:
-            try:
-                profile = zlib.decompress(chunk.split(b"\x00", 1)[1][1:])
-            except Exception:
-                profile = chunk
-            extra += icc_chunk_upper_bound(profile if isinstance(profile, bytes) else chunk)
+        next_index = index + 12 + length
+        if length < 0 or next_index > len(data):
+            break
+        # keyword is at most 79 bytes, then NUL and the compression method.
+        if kind == b"iCCP" and length <= PNG_PROFILE_ACCEPT_BYTES + 81:
+            extra += icc_chunk_upper_bound(PNG_PROFILE_ACCEPT_BYTES)
         if kind == b"IEND":
             break
+        index = next_index
     return extra
 
 
-def composite_output_upper_bound(images: object) -> int | None:
-    """PNG bytes to reserve before a mask composite, or None if a size is unknown."""
+def _jpeg_geometry_and_icc(data: bytes) -> tuple[tuple[int, int] | None, int]:
+    """Width, height, and stored ICC byte count. Does not decode or inflate."""
+    sof = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    index = 2
+    size = None
+    icc = 0
+    limit = len(data)
+    while index + 4 <= limit:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        while index < limit and data[index] == 0xFF:
+            index += 1
+        if index >= limit:
+            break
+        marker = data[index]
+        index += 1
+        if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            continue
+        if marker in {0xD9, 0xDA}:
+            break
+        if index + 2 > limit:
+            break
+        segment = int.from_bytes(data[index:index + 2], "big")
+        if segment < 2 or index + segment > limit:
+            break
+        payload_at = index + 2
+        payload_len = segment - 2
+        if marker == 0xE2 and payload_len >= 14 and data[payload_at:payload_at + 12] == b"ICC_PROFILE\x00":
+            icc += payload_len - 14
+        if marker in sof and size is None and payload_len >= 5:
+            height = int.from_bytes(data[payload_at + 1:payload_at + 3], "big")
+            width = int.from_bytes(data[payload_at + 3:payload_at + 5], "big")
+            if width > 0 and height > 0:
+                size = (width, height)
+        index += segment
+    return size, icc
+
+
+def _webp_icc_length(data: bytes) -> int:
+    """Stored ICCP payload length. Does not decode the bitstream."""
+    if not (data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP"):
+        return 0
+    index = 12
     total = 0
+    while index + 8 <= len(data):
+        kind = data[index:index + 4]
+        length = int.from_bytes(data[index + 4:index + 8], "little")
+        payload = index + 8
+        if length < 0 or payload + length > len(data):
+            break
+        if kind == b"ICCP":
+            total += length
+        index = payload + length + (length & 1)
+    return total
+
+
+def output_png_cap(data: bytes) -> int | None:
+    """Bytes to reserve before Pillow writes this image as an RGBA PNG.
+
+    JPEG and WebP profiles are measured from the bytes already in the file.
+    A PNG iCCP is not inflated; the reserve is Pillow's accept cap.
+    EXIF and text chunks are not copied into the composite, so they add nothing.
+    """
+    if data.startswith(b"\xff\xd8"):
+        size, icc = _jpeg_geometry_and_icc(data)
+        if not size:
+            return None
+        extra = icc_chunk_upper_bound(icc) if icc > 0 else 0
+        return png_rgba_upper_bound(size[0], size[1], extra)
+    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+        size = _sniff_webp(data)
+        if not size:
+            return None
+        icc = _webp_icc_length(data)
+        extra = icc_chunk_upper_bound(icc) if icc > 0 else 0
+        return png_rgba_upper_bound(size[0], size[1], extra)
+    size = sniff_image_size(data)
+    if not size:
+        return None
+    extra = png_ancillary_upper_bound(data) if data.startswith(b"\x89PNG\r\n\x1a\n") else 0
+    return png_rgba_upper_bound(size[0], size[1], extra)
+
+
+def composite_output_caps(images: object) -> list[int] | None:
+    """Per-image PNG caps, or None when any size cannot be known from the header."""
+    caps: list[int] = []
     entries = images if isinstance(images, (list, tuple)) else [images]
     saw = False
     for item in entries:
@@ -1306,13 +1382,20 @@ def composite_output_upper_bound(images: object) -> int | None:
         raw = item[0] if isinstance(item, tuple) else item
         if not isinstance(raw, (bytes, bytearray)):
             return None
-        blob = bytes(raw)
-        size = sniff_image_size(blob)
-        if not size:
+        cap = output_png_cap(bytes(raw))
+        if cap is None:
             return None
         saw = True
-        total += png_rgba_upper_bound(size[0], size[1], png_ancillary_upper_bound(blob))
-    return total if saw else 0
+        caps.append(cap)
+    return caps if saw else []
+
+
+def composite_output_upper_bound(images: object) -> int | None:
+    """PNG bytes to reserve before a mask composite, or None if a size is unknown."""
+    caps = composite_output_caps(images)
+    if caps is None:
+        return None
+    return sum(caps)
 
 
 def _host_task_cancelled() -> bool:

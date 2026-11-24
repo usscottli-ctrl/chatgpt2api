@@ -38,10 +38,14 @@ class _CappedBytesIO(BytesIO):
 class _EditStream:
     """One edit stream and the buffer lease it owns.
 
-    close() is idempotent from any thread. It marks the lease cancelled and
-    releases immediately only when no native step is inside next(). A running
-    encode keeps the bytes until it returns, and that return does not start
-    upstream. Garbage collection uses the same close.
+    ``next`` is single-threaded. A second caller is rejected and does not
+    enter the factory. ``close`` is idempotent from any thread: it marks the
+    lease cancelled, and a native step already inside ``next`` keeps the
+    bytes until it returns. That return does not start upstream.
+
+    Exhaustion, a generator error, and a cancelled HTTP request all clear
+    the payload before ``next`` returns, even if the caller keeps this
+    wrapper. Garbage collection uses the same ``close``.
     """
 
     def __init__(self, factory, hold, cleanup) -> None:
@@ -50,27 +54,66 @@ class _EditStream:
         self._cleanup = cleanup
         self._gen = None
         self._closed = False
+        self._gate = threading.Lock()
+        self._state = threading.Lock()
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self._closed and self._gen is None:
-            raise StopIteration
-        self._hold.enter_native()
+        if not self._gate.acquire(blocking=False):
+            raise RuntimeError("edit stream is already advancing")
         try:
-            if self._gen is None:
-                self._gen = self._factory()
-            return next(self._gen)
-        except StopIteration:
-            self._closed = True
-            raise
+            if self._closed:
+                raise StopIteration
+            self._hold.enter_native()
+            terminal = False
+            try:
+                if self._gen is None:
+                    self._gen = self._factory()
+                item = next(self._gen)
+            except StopIteration:
+                terminal = True
+                raise
+            except BaseException:
+                terminal = True
+                raise
+            else:
+                return item
+            finally:
+                stopped = self._hold.leave_native()
+                if terminal or stopped or _stream_request_cancelled():
+                    self._finish_stream()
         finally:
-            self._hold.leave_native()
+            self._gate.release()
+
+    def _finish_stream(self) -> None:
+        """Clear payload once this stream cannot produce another upstream call."""
+        self._closed = True
+        self._hold.request_close(self._cleanup)
+        self._drop_generator()
+
+    def _drop_generator(self) -> None:
+        """Drop a suspended generator. Never call this while next() is inside it."""
+        with self._state:
+            if self._hold.native:
+                return
+            gen = self._gen
+            self._gen = None
+        if gen is None:
+            return
+        closer = getattr(gen, "close", None)
+        if closer is None:
+            return
+        try:
+            closer()
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._closed = True
         self._hold.request_close(self._cleanup)
+        self._drop_generator()
 
     def __del__(self) -> None:
         try:
@@ -79,9 +122,16 @@ class _EditStream:
             pass
 
 
+def _stream_request_cancelled() -> bool:
+    from services.free_large_image_guard import request_cancel_is_set
+
+    return request_cancel_is_set()
+
+
 def _composite_mask(
     images: list[tuple[bytes, str, str]],
     masks: list[tuple[bytes, str, str]],
+    limits: list[int] | None = None,
 ) -> list[tuple[bytes, str, str]]:
     """将 mask 的 alpha 通道合成到图片中，标识需要编辑的区域。
     
@@ -92,6 +142,19 @@ def _composite_mask(
     if not masks:
         return images
     result: list[tuple[bytes, str, str]] = []
+    try:
+        return _composite_mask_into(images, masks, limits, result)
+    except BaseException:
+        result.clear()
+        raise
+
+
+def _composite_mask_into(
+    images: list[tuple[bytes, str, str]],
+    masks: list[tuple[bytes, str, str]],
+    limits: list[int] | None,
+    result: list[tuple[bytes, str, str]],
+) -> list[tuple[bytes, str, str]]:
     for i, (data, filename, mime_type) in enumerate(images):
         mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
         img = Image.open(BytesIO(data)).convert("RGBA")
@@ -104,13 +167,15 @@ def _composite_mask(
             alpha = mask_img.convert("L")
         alpha = alpha.resize(img.size, Image.LANCZOS)
         img.putalpha(alpha)
-        from services.free_large_image_guard import icc_chunk_upper_bound, png_rgba_upper_bound
-
+        # Pillow's PNG writer copies icc_profile from the image. Dropping it
+        # would change color. The caller reserved ``limits[i]`` for that
+        # profile; the sink cannot grow past the same number.
         icc = img.info.get("icc_profile") if isinstance(getattr(img, "info", None), dict) else None
-        extra = icc_chunk_upper_bound(icc) if isinstance(icc, (bytes, bytearray)) else 0
-        limit = png_rgba_upper_bound(img.size[0], img.size[1], extra)
-        buf = _CappedBytesIO(limit)
-        if isinstance(icc, (bytes, bytearray)):
+        if limits is not None:
+            buf: BytesIO = _CappedBytesIO(int(limits[i] if i < len(limits) else 0))
+        else:
+            buf = BytesIO()
+        if isinstance(icc, (bytes, bytearray)) and icc:
             img.save(buf, format="PNG", icc_profile=icc)
         else:
             img.save(buf, format="PNG")
@@ -130,13 +195,14 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         LargeImageAdmissionError,
         base64_payload_length,
         bind_large_image_job,
-        composite_output_upper_bound,
+        composite_output_caps,
         edit_input_guard_pixels,
         heavy_image_work,
+        icc_chunk_upper_bound,
         is_enabled,
         payload_byte_length,
-        raise_if_request_cancelled,
         png_rgba_upper_bound,
+        raise_if_request_cancelled,
         reserve_edit_buffers,
     )
     from services.protocol.conversation import _admission_error_code
@@ -153,21 +219,25 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
             if guard_pixels:
                 with heavy_image_work(discovered_pixels=guard_pixels, stage="edit_input"):
                     if masks and hold is not None:
-                        upper = composite_output_upper_bound(images)
-                        if upper is None:
-                            discovered = []
+                        caps = composite_output_caps(images)
+                        if caps is None:
+                            caps = []
                             for item in images:
                                 part = item[0] if isinstance(item, tuple) and item else b""
                                 with Image.open(BytesIO(part)) as opened:
                                     opened.load()
-                                    discovered.append(opened.size)
+                                    info = opened.info if isinstance(getattr(opened, "info", None), dict) else {}
+                                    profile = info.get("icc_profile")
+                                    extra = icc_chunk_upper_bound(len(profile)) if isinstance(profile, (bytes, bytearray)) else 0
+                                    caps.append(png_rgba_upper_bound(opened.size[0], opened.size[1], extra))
                             item = None
                             part = None
-                            upper = sum(png_rgba_upper_bound(w, h) for w, h in discovered)
+                        upper = sum(caps)
                         hold.add(upper)
-                        produced = _composite_mask(images, masks)
+                        produced = _composite_mask(images, masks, caps)
                         actual = payload_byte_length(produced)
                         if actual > upper:
+                            produced.clear()
                             produced = None
                             raise LargeImageAdmissionError("buffer_budget")
                         hold.release_amount(upper - actual)
