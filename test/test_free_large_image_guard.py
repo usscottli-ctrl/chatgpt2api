@@ -3955,6 +3955,83 @@ class EditBufferBudgetTests(GuardTestCase):
                     self.assertEqual(body["mask"], [])
                     self._assert_drained()
 
+    def test_drop_traceback_payloads_leaves_running_frames(self) -> None:
+        def exited():
+            data = bytes(bytearray(b"x" * 8192))
+            managed = id(data)
+            other = bytes(bytearray(data))
+            try:
+                raise ValueError("offline diagnostic preserved")
+            except ValueError as exc:
+                return exc, managed, id(other)
+
+        exc, managed, other_id = exited()
+        lines = [(exc.__traceback__.tb_frame.f_code.co_name, exc.__traceback__.tb_lineno)]
+        guard.drop_traceback_payloads(exc, {managed})
+        frame = exc.__traceback__.tb_frame
+        self.assertIsNone(frame.f_locals.get("data"))
+        self.assertIs(type(exc), ValueError)
+        self.assertEqual(str(exc), "offline diagnostic preserved")
+        self.assertEqual(lines, [(frame.f_code.co_name, exc.__traceback__.tb_lineno)])
+        if frame.f_locals.get("other") is not None:
+            self.assertEqual(id(frame.f_locals.get("other")), other_id)
+
+        def still_running():
+            data = bytes(bytearray(b"y" * 8192))
+            original = id(data)
+            marker = 59
+            try:
+                raise ValueError("offline active-frame exception")
+            except ValueError as caught:
+                self.assertIn(id(caught.__traceback__.tb_frame), guard._stack_frame_ids())
+                guard.drop_traceback_payloads(caught, {original})
+                return id(data) == original and data is not None and marker == 59 and type(caught) is ValueError
+
+        self.assertTrue(still_running())
+
+        ready = threading.Event()
+        release = threading.Event()
+        shared: dict = {}
+
+        def other_thread():
+            data = bytes(bytearray(b"z" * 8192))
+            own = id(data)
+            try:
+                raise RuntimeError("offline live worker exception")
+            except RuntimeError as caught:
+                shared["exception"] = caught
+                shared["managed_id"] = own
+                shared["frame_id"] = id(caught.__traceback__.tb_frame)
+                ready.set()
+                release.wait(5)
+                shared["preserved"] = id(data) == own and data is not None
+
+        worker = threading.Thread(target=other_thread)
+        worker.start()
+        self.assertTrue(ready.wait(3))
+        self.assertIn(shared["frame_id"], guard._stack_frame_ids())
+        worker_bytes_id = shared["managed_id"]
+        guard.drop_traceback_payloads(shared["exception"], {worker_bytes_id})
+        live_obj = shared["exception"].__traceback__.tb_frame.f_locals["data"]
+
+        def finished_alias(payload):
+            data = payload
+            try:
+                raise ValueError("offline finished alias")
+            except ValueError as exc2:
+                return exc2, id(data)
+
+        alias_exc, alias_id = finished_alias(live_obj)
+        self.assertEqual(alias_id, worker_bytes_id)
+        self.assertNotIn(id(alias_exc.__traceback__.tb_frame), guard._stack_frame_ids())
+        guard.drop_traceback_payloads(alias_exc, {worker_bytes_id})
+        self.assertIsNone(alias_exc.__traceback__.tb_frame.f_locals.get("data"))
+        self.assertIs(shared["exception"].__traceback__.tb_frame.f_locals.get("data"), live_obj)
+        release.set()
+        worker.join(5)
+        self.assertTrue(shared["preserved"])
+        self._assert_drained()
+
     def test_reservation_is_a_hard_upper_bound(self) -> None:
         guard.configure_limits(max_retained_edit_bytes=1000)
         first = guard.reserve_edit_buffers(600)

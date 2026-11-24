@@ -74,6 +74,7 @@ import contextvars
 import importlib.util
 import logging
 import os
+import sys
 import threading
 import time
 from collections import deque
@@ -1203,13 +1204,30 @@ def reserve_edit_buffers(nbytes: int) -> EditBufferHold:
     return hold
 
 
-def drop_traceback_payloads(exc: BaseException, payloads: set[int]) -> None:
-    """Drop direct locals that are these exact payload objects.
+def _stack_frame_ids() -> set[int]:
+    """Frame ids on any thread's stack right now.
 
-    The exception, its traceback, and every other local stay in place. A
-    finished frame that still holds one of these objects after a single-name
-    clear loses that frame's locals. The stack lines remain. This is not a
-    process-wide out-of-memory handler.
+    ``sys._current_frames`` plus ``f_back`` is the check used before a write.
+    A frame in this set is left unchanged. A frame absent from it is treated
+    as finished. This does not claim the classification stays true after the
+    check returns.
+    """
+    found: set[int] = set()
+    for frame in sys._current_frames().values():
+        while frame is not None:
+            found.add(id(frame))
+            frame = frame.f_back
+    return found
+
+
+def drop_traceback_payloads(exc: BaseException, payloads: set[int]) -> None:
+    """Drop direct locals that are these exact payload objects on finished frames.
+
+    A frame that is on any thread's stack is not written. The same bytes
+    object may still be cleared from a different frame that has already
+    returned. The exception, traceback lines, and every other local stay.
+    A finished frame whose name cannot be cleared by assignment loses that
+    frame's locals. This is not a process-wide out-of-memory handler.
     """
     import types
 
@@ -1237,30 +1255,26 @@ def drop_traceback_payloads(exc: BaseException, payloads: set[int]) -> None:
             pairs = list(frame.f_locals.items())
         except Exception:
             continue
-        held = False
-        writable = frame.f_locals
-        for key, value in pairs:
+        for _key, value in pairs:
             if isinstance(value, (BaseException, types.TracebackType, dict, list, tuple)):
                 pending.append(value)
+        if id(frame) in _stack_frame_ids():
+            continue
+        writable = frame.f_locals
+        held = False
+        for key, value in pairs:
             if id(value) not in payloads:
                 continue
             held = True
-            try:
-                writable[key] = None
-            except Exception:
-                pass
-        if not held:
+            writable[key] = None
+        if not held or id(frame) in _stack_frame_ids():
             continue
         try:
-            still = any(id(value) in payloads for value in frame.f_locals.values())
+            still = any(id(value) in payloads for value in list(frame.f_locals.values()))
         except Exception:
-            still = True
-        if not still:
-            continue
-        try:
+            still = False
+        if still and id(frame) not in _stack_frame_ids():
             frame.clear()
-        except RuntimeError:
-            pass
 
 
 def payload_byte_length(items: object) -> int:
