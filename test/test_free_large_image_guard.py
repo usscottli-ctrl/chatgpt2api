@@ -2948,6 +2948,204 @@ class RealRequestAdmissionTests(GuardTestCase):
         self.assertEqual(guard.stats()["peak_admission_waiting"], 0)
         self._assert_drained()
 
+    def test_edit_cancel_does_not_start_upstream_or_pending_encode(self) -> None:
+        import httpx
+        import main
+        from services.protocol import openai_v1_image_edit as edit
+        from services.protocol.conversation import ImageOutput
+
+        def image_body(req, index, total):
+            return [ImageOutput(
+                kind="result", model=req.model, index=index, total=total,
+                data=[{"b64_json": "b2ZmbGluZQ=="}],
+            )]
+
+        for n in (1, 4):
+            with self.subTest(stage="encode", n=n):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(admission_wait_secs=3, wait_timeout_secs=5)
+                release = threading.Event()
+                entered = threading.Event()
+                calls: list[int] = []
+                encoded = {"n": 0}
+
+                def encode(images):
+                    encoded["n"] += 1
+                    entered.set()
+                    release.wait(timeout=6)
+                    return ["encoded"]
+
+                def run_body(req, index, total):
+                    calls.append(index)
+                    return image_body(req, index, total)
+
+                async def scenario() -> None:
+                    with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                            mock.patch.object(edit, "encode_images", encode), \
+                            mock.patch.object(edit, "_composite_mask", lambda images, masks: images), \
+                            mock.patch("services.protocol.conversation._generate_single_image_body", run_body):
+                        async with httpx.AsyncClient(
+                            transport=httpx.ASGITransport(app=main.app),
+                            base_url="http://offline.test",
+                        ) as client:
+                            task = asyncio.create_task(client.post(
+                                "/v1/images/edits",
+                                data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": str(n), "stream": "false"},
+                                files={"image": ("offline.png", _png(3840, 2160), "image/png")},
+                            ))
+                            try:
+                                self.assertTrue(await self._until(entered.is_set))
+                                self.assertEqual(calls, [])
+                                self.assertEqual(guard.stats()["active"], 1)
+                                task.cancel()
+                                await asyncio.sleep(0.25)
+                                self.assertEqual(calls, [])
+                                self.assertEqual(guard.stats()["active"], 1)
+                                release.set()
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await task
+                                self.assertTrue(await self._until(
+                                    lambda: guard.stats()["active"] == 0 and guard.stats()["generating"] == 0,
+                                ))
+                                self.assertEqual(calls, [])
+                                self.assertEqual(encoded["n"], 1)
+                            finally:
+                                release.set()
+
+                asyncio.run(scenario())
+                self._assert_drained()
+
+        for n in (1, 4):
+            with self.subTest(stage="before_encode", n=n):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(admission_wait_secs=3, wait_timeout_secs=5)
+                release = threading.Event()
+                entered = threading.Event()
+                calls: list[int] = []
+                encoded = {"n": 0}
+
+                def composite(images, masks):
+                    entered.set()
+                    release.wait(timeout=6)
+                    return images
+
+                async def scenario() -> None:
+                    with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                            mock.patch.object(edit, "encode_images", lambda images: encoded.__setitem__("n", encoded["n"] + 1) or ["encoded"]), \
+                            mock.patch.object(edit, "_composite_mask", composite), \
+                            mock.patch("services.protocol.conversation._generate_single_image_body", lambda *args: calls.append(1) or image_body(*args)):
+                        async with httpx.AsyncClient(
+                            transport=httpx.ASGITransport(app=main.app),
+                            base_url="http://offline.test",
+                        ) as client:
+                            task = asyncio.create_task(client.post(
+                                "/v1/images/edits",
+                                data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": str(n), "stream": "false"},
+                                files={"image": ("offline.png", _png(3840, 2160), "image/png")},
+                            ))
+                            try:
+                                self.assertTrue(await self._until(entered.is_set))
+                                self.assertEqual(encoded["n"], 0)
+                                self.assertEqual(guard.stats()["active"], 1)
+                                task.cancel()
+                                await asyncio.sleep(0.25)
+                                self.assertEqual(guard.stats()["active"], 1)
+                                self.assertEqual(encoded["n"], 0)
+                                release.set()
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await task
+                                self.assertTrue(await self._until(
+                                    lambda: guard.stats()["active"] == 0 and guard.stats()["generating"] == 0,
+                                ))
+                                self.assertEqual(encoded["n"], 0)
+                                self.assertEqual(calls, [])
+                            finally:
+                                release.set()
+
+                asyncio.run(scenario())
+                self._assert_drained()
+
+        for n in (1, 4):
+            with self.subTest(stage="heavy_wait_disconnect", n=n):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(admission_wait_secs=3, wait_timeout_secs=5)
+                release = threading.Event()
+                calls: list[int] = []
+                encoded = {"n": 0}
+
+                def hold() -> None:
+                    with guard.heavy_image_work(discovered_pixels=3840 * 2160, stage="holder"):
+                        release.wait(timeout=8)
+
+                holders = [threading.Thread(target=hold) for _ in range(5)]
+                for thread in holders:
+                    thread.start()
+                self.assertTrue(self._wait_until(lambda: guard.stats()["active"] == 5))
+
+                async def scenario() -> None:
+                    request = httpx.Request(
+                        "POST",
+                        "http://offline.test/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": str(n), "stream": "false"},
+                        files={"image": ("offline.png", _png(3840, 2160), "image/png")},
+                    )
+                    payload = await request.aread()
+                    disconnected = asyncio.Event()
+                    received = {"done": False}
+                    statuses: list[int] = []
+
+                    async def receive():
+                        if not received["done"]:
+                            received["done"] = True
+                            return {"type": "http.request", "body": payload, "more_body": False}
+                        await disconnected.wait()
+                        return {"type": "http.disconnect"}
+
+                    async def send(message):
+                        if message["type"] == "http.response.start":
+                            statuses.append(message["status"])
+
+                    scope = {
+                        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+                        "http_version": "1.1", "method": "POST", "scheme": "http",
+                        "path": "/v1/images/edits", "raw_path": b"/v1/images/edits",
+                        "query_string": b"", "root_path": "",
+                        "headers": [(key.lower(), value) for key, value in request.headers.raw],
+                        "server": ("offline.test", 80), "client": ("127.0.0.1", 1),
+                    }
+                    with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                            mock.patch.object(edit, "encode_images", lambda images: encoded.__setitem__("n", encoded["n"] + 1) or ["encoded"]), \
+                            mock.patch.object(edit, "_composite_mask", lambda images, masks: images), \
+                            mock.patch("services.protocol.conversation._generate_single_image_body", lambda *args: calls.append(1) or image_body(*args)):
+                        task = asyncio.create_task(main.app(scope, receive, send))
+                        try:
+                            self.assertTrue(await self._until(lambda: guard.stats()["heavy_waiting"] == 1))
+                            self.assertEqual(encoded["n"], 0)
+                            self.assertEqual(calls, [])
+                            disconnected.set()
+                            await asyncio.sleep(0.45)
+                            self.assertEqual(encoded["n"], 0)
+                            self.assertEqual(calls, [])
+                            self.assertEqual(guard.stats()["heavy_waiting"], 0)
+                            release.set()
+                            for thread in holders:
+                                thread.join(timeout=2)
+                            await asyncio.wait_for(task, 4)
+                            self.assertEqual(statuses, [429])
+                            self.assertEqual(encoded["n"], 0)
+                            self.assertEqual(calls, [])
+                        finally:
+                            disconnected.set()
+                            release.set()
+
+                try:
+                    asyncio.run(scenario())
+                    self._assert_drained()
+                finally:
+                    release.set()
+                    for thread in holders:
+                        thread.join(timeout=2)
+
     async def _until(self, predicate, timeout: float = 3.0) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

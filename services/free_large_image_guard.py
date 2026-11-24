@@ -394,6 +394,18 @@ class Token:
         guard.tokens.pop(self.id, None)
         guard.cv.notify_all()
 
+    def _request_cancel_before_arm_locked(self) -> None:
+        """Drop a claim that has not armed when this HTTP request is already gone.
+
+        The permit inside an armed section stays with that thread. This does
+        not run while ``work_running`` is set, so a decode or encode that has
+        started is not cut off from another thread.
+        """
+        if self.work_running or not _request_cancel_is_set():
+            return
+        self._abandon_locked("cancelled")
+        raise LargeImageAdmissionError("cancelled")
+
     def _reap_cancelled_head_locked(self) -> bool:
         guard = self.guard
         if not guard.heavy_queue:
@@ -461,6 +473,7 @@ class Token:
             if self.state == "active" and self.work_running:
                 self.depth += 1
                 return
+            self._request_cancel_before_arm_locked()
             if self.cancelled and not self.work_running:
                 self._abandon_locked("cancelled")
                 raise LargeImageAdmissionError("cancelled")
@@ -473,6 +486,7 @@ class Token:
             self.stage = stage
             try:
                 while self.state != "active":
+                    self._request_cancel_before_arm_locked()
                     if self.state == "done":
                         raise LargeImageAdmissionError(self.fail_reason or "cancelled")
                     if self.cancelled and self.state in {"generating", "heavy_waiting"}:
@@ -497,7 +511,8 @@ class Token:
                     if remaining <= 0:
                         self._abandon_locked("queue_timeout")
                         raise LargeImageAdmissionError("queue_timeout")
-                    guard.cv.wait(remaining)
+                    guard.cv.wait(min(remaining, 0.2))
+                self._request_cancel_before_arm_locked()
                 self._arm_active_locked()
             except BaseException as exc:
                 if self.state in {"generating", "heavy_waiting"}:
@@ -1036,6 +1051,31 @@ def reset_request_cancel(token: contextvars.Token) -> None:
     _request_cancel.reset(token)
 
 
+def _request_cancel_is_set() -> bool:
+    """True when the inbound image request has been cancelled or disconnected.
+
+    A Sub2 poll is a different HTTP call and does not set this event.
+    """
+    event = _request_cancel.get()
+    if event is not None and event.is_set():
+        return True
+    return _host_task_cancelled()
+
+
+def raise_if_request_cancelled() -> None:
+    """Stop before the next decode, encode, or upstream call.
+
+    This does not release a permit. A section that is already inside an armed
+    permit returns it only when that native step returns. A step that has not
+    started must not start.
+    """
+    if not _request_cancel_is_set():
+        return
+    with _guard.cv:
+        _guard.cancelled += 1
+    raise LargeImageAdmissionError("cancelled")
+
+
 def _host_task_cancelled() -> bool:
     """True when the HTTP task that owns this worker thread has been cancelled."""
     try:
@@ -1187,6 +1227,9 @@ def bind_large_image_job(size: object) -> Iterator[Token | None]:
         return
     current = _current_token()
     if current is not None and current.state in {"generating", "heavy_waiting", "active"}:
+        # Reusing the parent claim must not skip the cancel check. The claim
+        # itself stays with the outer block; this raise does not drop it.
+        raise_if_request_cancelled()
         yield current
         return
     token = _begin_generation()
@@ -1341,6 +1384,7 @@ def heavy_image_work(
     try:
         token.enter_heavy(stage, _guard.wait_timeout_secs)
         try:
+            raise_if_request_cancelled()
             yield token
         finally:
             token.leave_heavy()

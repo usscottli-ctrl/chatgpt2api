@@ -58,6 +58,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         edit_input_guard_pixels,
         heavy_image_work,
         is_enabled,
+        raise_if_request_cancelled,
     )
     from services.protocol.conversation import _admission_error_code
 
@@ -68,7 +69,12 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         if guard_pixels:
             with heavy_image_work(discovered_pixels=guard_pixels, stage="edit_input"):
                 images = _composite_mask(images, masks)
+                # Composite may already be inside a native call. Do not start
+                # encode when the request died during that call.
+                raise_if_request_cancelled()
                 encoded_images = encode_images(images)
+            # Encode is not interruptible. Observe cancel before any upstream.
+            raise_if_request_cancelled()
         else:
             images = _composite_mask(images, masks)
             encoded_images = encode_images(images)
