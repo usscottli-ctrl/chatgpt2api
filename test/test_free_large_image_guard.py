@@ -2614,6 +2614,359 @@ class AdmissionWaitTests(GuardTestCase):
         return ConcurrencyTests._wait_until(self, predicate, timeout)
 
 
+class RealRequestAdmissionTests(GuardTestCase):
+    """Cancellation has to be the inbound generation request, not an AnyIO-only scope."""
+
+    def test_http_cancel_and_disconnect_do_not_start_upstream(self) -> None:
+        import json
+
+        import httpx
+        import main
+
+        for n, disconnect in ((1, False), (4, False), (1, True), (4, True)):
+            with self.subTest(n=n, disconnect=disconnect):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(
+                    max_active=1,
+                    max_heavy_waiting=1,
+                    max_generating=1,
+                    admission_wait_secs=3,
+                )
+                release = threading.Event()
+                calls: list[int] = []
+
+                def hold() -> None:
+                    with guard.bind_large_image_job("2K"):
+                        release.wait(timeout=8)
+
+                holder = threading.Thread(target=hold)
+                holder.start()
+                self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 1))
+
+                def body(req, index, total):
+                    calls.append(index)
+                    from services.protocol.conversation import ImageOutput
+                    return [ImageOutput(
+                        kind="result", model=req.model, index=index, total=total,
+                        data=[{"b64_json": "b2ZmbGluZQ=="}],
+                    )]
+
+                async def scenario() -> None:
+                    with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                            mock.patch("services.protocol.conversation._generate_single_image_body", body):
+                        if not disconnect:
+                            async with httpx.AsyncClient(
+                                transport=httpx.ASGITransport(app=main.app),
+                                base_url="http://offline.test",
+                            ) as client:
+                                task = asyncio.create_task(client.post(
+                                    "/v1/images/generations",
+                                    json={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": n, "stream": False},
+                                ))
+                                self.assertTrue(await self._until(lambda: guard.stats()["admission_waiting"] == n))
+                                task.cancel()
+                                try:
+                                    await task
+                                except asyncio.CancelledError:
+                                    pass
+                        else:
+                            disconnected = asyncio.Event()
+                            received = {"done": False}
+                            payload = json.dumps({
+                                "model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": n, "stream": False,
+                            }).encode()
+
+                            async def receive():
+                                if not received["done"]:
+                                    received["done"] = True
+                                    return {"type": "http.request", "body": payload, "more_body": False}
+                                await disconnected.wait()
+                                return {"type": "http.disconnect"}
+
+                            async def send(_message):
+                                return None
+
+                            scope = {
+                                "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+                                "http_version": "1.1", "method": "POST", "scheme": "http",
+                                "path": "/v1/images/generations", "raw_path": b"/v1/images/generations",
+                                "query_string": b"", "root_path": "",
+                                "headers": [
+                                    (b"host", b"offline.test"),
+                                    (b"content-type", b"application/json"),
+                                    (b"content-length", str(len(payload)).encode()),
+                                ],
+                                "server": ("offline.test", 80), "client": ("127.0.0.1", 1),
+                            }
+                            task = asyncio.create_task(main.app(scope, receive, send))
+                            self.assertTrue(await self._until(lambda: guard.stats()["admission_waiting"] == n))
+                            disconnected.set()
+                        await asyncio.sleep(0.45)
+                        self.assertEqual(calls, [])
+                        self.assertEqual(guard.stats()["admission_waiting"], 0)
+                        release.set()
+                        holder.join(timeout=2)
+                        await asyncio.sleep(0.3)
+                        self.assertEqual(calls, [])
+
+                asyncio.run(scenario())
+                self._assert_drained()
+
+    def test_cancel_keeps_armed_permit_and_does_not_start_the_rest(self) -> None:
+        import httpx
+        import main
+        from services.protocol.conversation import ImageOutput
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(
+            max_active=1, max_heavy_waiting=1, max_generating=1, admission_wait_secs=3,
+        )
+        finish = threading.Event()
+        started = threading.Event()
+        calls: list[int] = []
+
+        def body(req, index, total):
+            calls.append(index)
+            started.set()
+            finish.wait(timeout=5)
+            return [ImageOutput(
+                kind="result", model=req.model, index=index, total=total,
+                data=[{"b64_json": "b2ZmbGluZQ=="}],
+            )]
+
+        async def scenario() -> None:
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch("services.protocol.conversation._generate_single_image_body", body):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=main.app),
+                    base_url="http://offline.test",
+                ) as client:
+                    task = asyncio.create_task(client.post(
+                        "/v1/images/generations",
+                        json={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": 4, "stream": False},
+                    ))
+                    try:
+                        self.assertTrue(await self._until(lambda: started.is_set() and guard.stats()["admission_waiting"] == 3))
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual(guard.stats()["generating"], 1)
+                        task.cancel()
+                        await asyncio.sleep(0.4)
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual(guard.stats()["admission_waiting"], 0)
+                        self.assertEqual(guard.stats()["generating"], 1)
+                        finish.set()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                        await asyncio.sleep(0.3)
+                        self.assertEqual(len(calls), 1)
+                    finally:
+                        finish.set()
+
+        asyncio.run(scenario())
+        self._assert_drained()
+
+    def test_n4_capacity_errors_stay_429_and_partial_success_is_not_rerun(self) -> None:
+        import httpx
+
+        import main
+        from services.protocol.conversation import ImageGenerationError, ImageOutput
+
+        cases = (
+            ("full", True, None, 16, "free_large_image_admission_full"),
+            ("timeout", False, None, 0, "free_large_image_admission_timeout"),
+            ("mixed", False, 1, 0, "free_large_image_admission_full"),
+        )
+        for name, full, admission_cap, fillers_n, expected in cases:
+            with self.subTest(name=name):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(
+                    max_active=1, max_heavy_waiting=1, max_generating=1,
+                    admission_wait_secs=2 if full else 0.08,
+                    **({} if admission_cap is None else {"max_admission_waiting": admission_cap}),
+                )
+                release = threading.Event()
+
+                def hold() -> None:
+                    with guard.bind_large_image_job("2K"):
+                        release.wait(timeout=5)
+
+                holder = threading.Thread(target=hold)
+                holder.start()
+                self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 1))
+                fillers = []
+                if fillers_n:
+                    def fill() -> None:
+                        try:
+                            with guard.bind_large_image_job("2K"):
+                                pass
+                        except LargeImageAdmissionError:
+                            return
+
+                    fillers = [threading.Thread(target=fill) for _ in range(fillers_n)]
+                    for thread in fillers:
+                        thread.start()
+                    self.assertTrue(self._wait_until(lambda: guard.stats()["admission_waiting"] == fillers_n))
+                calls: list[int] = []
+
+                def body(*_args):
+                    calls.append(1)
+                    return []
+
+                async def post(n: int):
+                    with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                            mock.patch("services.protocol.conversation._generate_single_image_body", body):
+                        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                            response = await client.post(
+                                "/v1/images/generations",
+                                json={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": n, "stream": False},
+                            )
+                    return response
+
+                try:
+                    response = asyncio.run(post(4))
+                    self.assertEqual(response.status_code, 429, response.text)
+                    self.assertEqual(response.json()["error"]["code"], expected)
+                    self.assertEqual(calls, [])
+                finally:
+                    release.set()
+                    holder.join(timeout=2)
+                    for thread in fillers:
+                        thread.join(timeout=2)
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(admission_wait_secs=2)
+        seen: list[int] = []
+
+        def mixed(req, index, total):
+            seen.append(index)
+            if index == 2:
+                raise ImageGenerationError("decode failed", status_code=500, error_type="server_error", code="decode_failed")
+            return [ImageOutput(kind="result", model=req.model, index=index, total=total, data=[{"b64_json": "b2ZmbGluZQ=="}])]
+
+        async def partial():
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch("services.protocol.conversation._generate_single_image_body", mixed):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    return await client.post(
+                        "/v1/images/generations",
+                        json={"model": "gpt-image-2", "prompt": "offline", "size": "1024x1024", "n": 4, "stream": False},
+                    )
+
+        response = asyncio.run(partial())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["data"]), 3)
+        self.assertEqual(sorted(seen), [1, 2, 3, 4])
+        self._assert_drained()
+
+    def test_large_edit_waits_before_decode_and_known_1k_bypasses(self) -> None:
+        import httpx
+
+        import main
+        from services.protocol import openai_v1_image_edit as edit
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(admission_wait_secs=3)
+        release = threading.Event()
+
+        def hold() -> None:
+            with guard.bind_large_image_job("2K"):
+                release.wait(timeout=6)
+
+        holders = [threading.Thread(target=hold) for _ in range(15)]
+        for thread in holders:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 15))
+        encoded_at: list[int] = []
+        composed: list[int] = []
+
+        def encode(images):
+            encoded_at.append(guard.stats()["admission_waiting"])
+            return ["encoded"]
+
+        def composite(images, masks):
+            composed.append(guard.stats()["admission_waiting"])
+            return images
+
+        def body(req, index, total):
+            from services.protocol.conversation import ImageOutput
+            return [ImageOutput(kind="result", model=req.model, index=index, total=total, data=[{"b64_json": "b2ZmbGluZQ=="}])]
+
+        async def large_case():
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch.object(edit, "encode_images", encode), \
+                    mock.patch.object(edit, "_composite_mask", composite), \
+                    mock.patch("services.protocol.conversation._generate_single_image_body", body):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    task = asyncio.create_task(client.post(
+                        "/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": "1", "stream": "false"},
+                        files={"image": ("offline.png", _png(3840, 2160), "image/png")},
+                    ))
+                    try:
+                        self.assertTrue(await self._until(lambda: guard.stats()["admission_waiting"] == 1 or task.done()))
+                        self.assertFalse(task.done(), "edit finished before admission")
+                        self.assertEqual(composed, [])
+                        self.assertEqual(encoded_at, [])
+                        self.assertEqual(guard.stats()["admission_waiting"], 1)
+                        release.set()
+                        for thread in holders:
+                            thread.join(timeout=2)
+                        return await asyncio.wait_for(task, 3)
+                    finally:
+                        release.set()
+
+        try:
+            response = asyncio.run(large_case())
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(composed, [0])
+            self.assertEqual(encoded_at, [0])
+            self._assert_drained()
+        finally:
+            release.set()
+            for thread in holders:
+                thread.join(timeout=2)
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(admission_wait_secs=0)
+
+        async def small_case():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                        mock.patch.object(edit, "encode_images", lambda images: ["small"]), \
+                        mock.patch.object(edit, "_composite_mask", lambda images, masks: images), \
+                        mock.patch("services.protocol.conversation._generate_single_image_body", body):
+                    response = await client.post(
+                        "/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "1024x1024", "n": "1", "stream": "false"},
+                        files={"image": ("small.png", _png(1024, 1024), "image/png")},
+                    )
+            return response
+
+        response = asyncio.run(small_case())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(guard.stats()["peak_active"], 0)
+        self.assertEqual(guard.stats()["peak_admission_waiting"], 0)
+        self._assert_drained()
+
+    async def _until(self, predicate, timeout: float = 3.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(0.005)
+        return bool(predicate())
+
+    def _assert_drained(self) -> None:
+        self.assertEqual(guard.token_snapshot(), [], guard.token_snapshot())
+        self.assertEqual(guard.stats()["admission_waiting"], 0)
+        self.assertEqual(guard.stats()["generating"], 0)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertIsNone(guard.consistency())
+
+    def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
+        return ConcurrencyTests._wait_until(self, predicate, timeout)
+
+
 class _StreamingBackend:
     """Session shaped like the real client. ``download_image_bytes`` is the production method."""
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
@@ -9,6 +12,7 @@ from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.editable_file_task_service import editable_file_task_service
+from services import free_large_image_guard
 from services.log_service import LoggedCall
 from services.protocol import (
     anthropic_v1_messages,
@@ -77,6 +81,43 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
         raise
 
 
+async def _watch_image_request(request: Request, stop: threading.Event, parent: asyncio.Task) -> None:
+    """Stop admission waits when this inbound request is cancelled or disconnected.
+
+    A Sub2 task poll is a different HTTP call. Closing that poll does not
+    disconnect the upstream generation request, so it does not set this event.
+    """
+    try:
+        while not stop.is_set():
+            if parent.cancelling() or (parent.done() and parent.cancelled()):
+                stop.set()
+                return
+            if await request.is_disconnected():
+                stop.set()
+                return
+            await asyncio.sleep(0.05)
+    except asyncio.CancelledError:
+        stop.set()
+        raise
+
+
+async def _run_image_call(request: Request, call: LoggedCall, handler, payload):
+    stop = threading.Event()
+    token = free_large_image_guard.attach_request_cancel(stop)
+    parent = asyncio.current_task()
+    watcher = None
+    if parent is not None:
+        watcher = asyncio.create_task(_watch_image_request(request, stop, parent))
+    try:
+        return await call.run(handler, payload)
+    finally:
+        if parent is not None and parent.cancelling():
+            stop.set()
+        if watcher is not None:
+            watcher.cancel()
+        free_large_image_guard.reset_request_cancel(token)
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -99,7 +140,7 @@ def create_router() -> APIRouter:
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
-        return await call.run(openai_v1_image_generations.handle, payload)
+        return await _run_image_call(request, call, openai_v1_image_generations.handle, payload)
 
     @router.post("/v1/images/edits")
     async def edit_images(
@@ -116,7 +157,7 @@ def create_router() -> APIRouter:
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
-        return await call.run(openai_v1_image_edit.handle, payload)
+        return await _run_image_call(request, call, openai_v1_image_edit.handle, payload)
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):

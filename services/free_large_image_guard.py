@@ -70,6 +70,7 @@ cap of 5 on every large generation, and it is not Sub2 group #44.
 from __future__ import annotations
 
 import base64
+import contextvars
 import importlib.util
 import logging
 import os
@@ -117,6 +118,10 @@ _OFF = {"0", "false", "off", "no", "disabled"}
 _ON = {"1", "true", "on", "yes", "free"}
 
 _tls = threading.local()
+_request_cancel: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "free_large_image_request_cancel",
+    default=None,
+)
 
 
 class LargeImageAdmissionError(Exception):
@@ -246,6 +251,7 @@ class Token:
         self.stage = ""
         self.fail_reason = ""
         self.owner_ident = 0
+        self.resume_as_generating = False
 
     def _is_owner(self) -> bool:
         return self.owner_ident != 0 and threading.get_ident() == self.owner_ident
@@ -446,6 +452,10 @@ class Token:
         with guard.cv:
             if not self._is_owner():
                 raise LargeImageAdmissionError("foreign_thread")
+            if self.state == "generating":
+                # This claim continues after the heavy section so the same
+                # thread can generate without taking a second one.
+                self.resume_as_generating = True
             if self.state == "done":
                 raise LargeImageAdmissionError(self.fail_reason or "cancelled")
             if self.state == "active" and self.work_running:
@@ -516,12 +526,12 @@ class Token:
             self.work_running = False
             if guard.active > 0:
                 guard.active -= 1
-            if self.closed:
-                self.state = "done"
-                guard.tokens.pop(self.id, None)
+            if self.resume_as_generating and not self.closed:
+                guard.generating += 1
+                if guard.generating > guard.peak_generating:
+                    guard.peak_generating = guard.generating
+                self.state = "generating"
             else:
-                # The heavy section is over. The task is no longer generating
-                # or waiting; close() is idempotent if it runs next.
                 self.state = "done"
                 guard.tokens.pop(self.id, None)
             guard.cv.notify_all()
@@ -1017,6 +1027,15 @@ def _generation_block_reason_locked() -> str | None:
     return None
 
 
+def attach_request_cancel(event: threading.Event) -> contextvars.Token:
+    """Publish the inbound HTTP request's cancel signal to worker threads."""
+    return _request_cancel.set(event)
+
+
+def reset_request_cancel(token: contextvars.Token) -> None:
+    _request_cancel.reset(token)
+
+
 def _host_task_cancelled() -> bool:
     """True when the HTTP task that owns this worker thread has been cancelled."""
     try:
@@ -1060,7 +1079,8 @@ def _begin_generation() -> Token:
             while True:
                 if _guard.epoch != epoch:
                     raise LargeImageAdmissionError("cancelled")
-                if token.cancelled or _host_task_cancelled():
+                event = _request_cancel.get()
+                if token.cancelled or (event is not None and event.is_set()) or _host_task_cancelled():
                     _guard.cancelled += 1
                     raise LargeImageAdmissionError("cancelled")
                 if _guard.admission_queue and _guard.admission_queue[0] is token:

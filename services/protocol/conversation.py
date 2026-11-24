@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
 import re
 import threading
@@ -1661,7 +1662,9 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     errors: dict[int, Exception] = {}
     with ThreadPoolExecutor(max_workers=request.n) as executor:
         for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, request, index, request.n)
+            # Child threads do not inherit the AnyIO worker context on their own.
+            ctx = contextvars.copy_context()
+            future = executor.submit(ctx.run, _generate_single_image, request, index, request.n)
             futures[future] = index
 
         # 按完成顺序收集结果
@@ -1706,6 +1709,31 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 })
 
     if not emitted:
+        capacity = [
+            exc for exc in errors.values()
+            if isinstance(exc, ImageGenerationError) and exc.status_code == 429 and exc.code
+        ]
+        if errors and len(capacity) == len(errors):
+            # Every image failed with a capacity 429 before its upstream call.
+            # One shared code is returned as-is. Mixed capacity codes stay 429
+            # too: a full line is reported as full, not rewritten into a 502.
+            # Successes above are yielded once and are not generated again.
+            # Nothing here is a durable idempotency record.
+            chosen = capacity[0]
+            if len({exc.code for exc in capacity}) != 1:
+                order = (
+                    "free_large_image_admission_full",
+                    "free_large_image_queue_full",
+                    "free_large_image_handoff_full",
+                    "free_large_image_generation_busy",
+                    "free_large_image_admission_timeout",
+                )
+                by_code = {exc.code: exc for exc in capacity}
+                for code in order:
+                    if code in by_code:
+                        chosen = by_code[code]
+                        break
+            raise chosen
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
