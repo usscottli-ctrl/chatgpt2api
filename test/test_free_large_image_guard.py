@@ -3860,6 +3860,101 @@ class EditBufferBudgetTests(GuardTestCase):
         self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
         self._assert_drained()
 
+    def test_allocation_failure_drops_managed_payload_from_finished_frames(self) -> None:
+        import types
+
+        from services.protocol.conversation import ImageOutput
+        from services.protocol.openai_v1_image_edit import handle
+
+        def output(req, index, total):
+            return [ImageOutput(
+                kind="result", model=req.model, index=index, total=total,
+                data=[{"b64_json": "b2ZmbGluZQ=="}],
+            )]
+
+        def held(exc: BaseException, ids: set[int]) -> list[str]:
+            pending: list[object] = [exc]
+            seen: set[int] = set()
+            found: list[str] = []
+            while pending:
+                obj = pending.pop()
+                if obj is None or id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                if isinstance(obj, BaseException):
+                    pending.extend((obj.__traceback__, obj.__cause__, obj.__context__))
+                elif isinstance(obj, types.TracebackType):
+                    frame = obj.tb_frame
+                    pending.append(obj.tb_next)
+                    filename = frame.f_code.co_filename.replace("\\", "/")
+                    if "services/" not in filename and not filename.endswith("/base64.py"):
+                        continue
+                    for key, value in frame.f_locals.items():
+                        if id(value) in ids:
+                            found.append(f"{frame.f_code.co_name}.{key}")
+                    pending.extend(frame.f_locals.values())
+                elif isinstance(obj, dict):
+                    pending.extend(obj.values())
+                elif isinstance(obj, (list, tuple)):
+                    pending.extend(obj)
+            return found
+
+        raw = _solid_png(2048, 1024)
+        mask = _solid_png(2048, 1024)
+        for stage in ("metadata", "encode"):
+            for n, stream in ((1, False), (4, False), (4, True)):
+                with self.subTest(stage=stage, n=n, stream=stream):
+                    reset_for_tests(enabled=True)
+                    upload = memoryview(raw).tobytes()
+                    mask_bytes = memoryview(mask).tobytes()
+                    ids = {id(upload), id(mask_bytes)}
+                    body = {
+                        "images": [(upload, "a.png", "image/png")],
+                        "mask": [(mask_bytes, "m.png", "image/png")],
+                        "prompt": "offline", "model": "gpt-image-2", "size": "1024x1024",
+                        "n": n, "stream": stream,
+                    }
+                    del upload, mask_bytes
+                    saved = None
+                    from services.protocol import openai_v1_image_edit as edit_module
+
+                    original_composite = edit_module._composite_mask
+
+                    def composite(images, masks, limits=None):
+                        result = original_composite(images, masks, limits)
+                        for item in result:
+                            ids.add(id(item[0]))
+                        return result
+
+                    def fail(*_args, **_kwargs):
+                        raise MemoryError("offline injected allocation failure")
+
+                    patches = [
+                        mock.patch("services.protocol.openai_v1_image_edit._composite_mask", composite),
+                        mock.patch("services.protocol.conversation._generate_single_image_body", output),
+                    ]
+                    if stage == "metadata":
+                        patches.append(mock.patch(
+                            "services.free_large_image_guard.png_ancillary_upper_bound",
+                            side_effect=fail,
+                        ))
+                    else:
+                        patches.append(mock.patch("base64.binascii.b2a_base64", side_effect=fail))
+                    with patches[0], patches[1], patches[2]:
+                        try:
+                            result = handle(body)
+                            if stream:
+                                list(result)
+                        except BaseException as exc:
+                            saved = exc
+                    self.assertIsNotNone(saved)
+                    self.assertNotIn("recursion", str(saved).lower())
+                    self.assertEqual(held(saved, ids), [])
+                    self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+                    self.assertEqual(body["images"], [])
+                    self.assertEqual(body["mask"], [])
+                    self._assert_drained()
+
     def test_reservation_is_a_hard_upper_bound(self) -> None:
         guard.configure_limits(max_retained_edit_bytes=1000)
         first = guard.reserve_edit_buffers(600)

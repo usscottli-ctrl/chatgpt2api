@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 from io import BytesIO
 from typing import Any, Iterator
@@ -294,6 +295,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         base64_payload_length,
         bind_large_image_job,
         composite_output_caps,
+        drop_traceback_payloads,
         edit_input_guard_pixels,
         heavy_image_work,
         icc_chunk_upper_bound,
@@ -449,7 +451,34 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         _clear_payload()
         raise _busy(exc) from exc
 
+    def _managed_ids() -> set[int]:
+        found: set[int] = set()
+
+        def add(group: object) -> None:
+            if isinstance(group, (bytes, bytearray)):
+                found.add(id(group))
+                return
+            if not isinstance(group, list):
+                return
+            for item in group:
+                raw = item[0] if isinstance(item, tuple) and item else item
+                if isinstance(raw, (bytes, bytearray)):
+                    found.add(id(raw))
+
+        add(images)
+        add(masks)
+        add(encoded_images)
+        add(body.get("images"))
+        add(body.get("mask"))
+        return found
+
     def _release() -> None:
+        # Finished frames, including stdlib base64, can still name a payload
+        # this request reserved. Drop those names before the counter returns
+        # to zero. The exception and its stack lines stay.
+        exc = sys.exception()
+        if exc is not None:
+            drop_traceback_payloads(exc, _managed_ids())
         _clear_payload()
         if hold is not None:
             hold.release()

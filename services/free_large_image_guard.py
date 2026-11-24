@@ -1203,6 +1203,66 @@ def reserve_edit_buffers(nbytes: int) -> EditBufferHold:
     return hold
 
 
+def drop_traceback_payloads(exc: BaseException, payloads: set[int]) -> None:
+    """Drop direct locals that are these exact payload objects.
+
+    The exception, its traceback, and every other local stay in place. A
+    finished frame that still holds one of these objects after a single-name
+    clear loses that frame's locals. The stack lines remain. This is not a
+    process-wide out-of-memory handler.
+    """
+    import types
+
+    seen: set[int] = set()
+    pending: list[object] = [exc]
+    while pending:
+        obj = pending.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, BaseException):
+            pending.extend((obj.__traceback__, obj.__cause__, obj.__context__))
+            continue
+        if isinstance(obj, dict):
+            pending.extend(obj.values())
+            continue
+        if isinstance(obj, (list, tuple)):
+            pending.extend(obj)
+            continue
+        if not isinstance(obj, types.TracebackType):
+            continue
+        pending.append(obj.tb_next)
+        frame = obj.tb_frame
+        try:
+            pairs = list(frame.f_locals.items())
+        except Exception:
+            continue
+        held = False
+        writable = frame.f_locals
+        for key, value in pairs:
+            if isinstance(value, (BaseException, types.TracebackType, dict, list, tuple)):
+                pending.append(value)
+            if id(value) not in payloads:
+                continue
+            held = True
+            try:
+                writable[key] = None
+            except Exception:
+                pass
+        if not held:
+            continue
+        try:
+            still = any(id(value) in payloads for value in frame.f_locals.values())
+        except Exception:
+            still = True
+        if not still:
+            continue
+        try:
+            frame.clear()
+        except RuntimeError:
+            pass
+
+
 def payload_byte_length(items: object) -> int:
     total = 0
     entries = items if isinstance(items, (list, tuple)) else [items]
@@ -1266,81 +1326,90 @@ def png_ancillary_upper_bound(data: bytes) -> int:
     even when zlib stores it slightly larger. One such output profile is
     reserved, and a profile Pillow will refuse is rejected by Pillow's reader.
     """
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+    try:
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return 0
+        index = 8
+        while index + 12 <= len(data):
+            length = int.from_bytes(data[index:index + 4], "big")
+            kind = data[index + 4:index + 8]
+            next_index = index + 12 + length
+            if length < 0 or next_index > len(data):
+                break
+            if kind == b"iCCP":
+                return icc_chunk_upper_bound(PNG_PROFILE_ACCEPT_BYTES)
+            if kind == b"IEND":
+                break
+            index = next_index
         return 0
-    index = 8
-    while index + 12 <= len(data):
-        length = int.from_bytes(data[index:index + 4], "big")
-        kind = data[index + 4:index + 8]
-        next_index = index + 12 + length
-        if length < 0 or next_index > len(data):
-            break
-        if kind == b"iCCP":
-            return icc_chunk_upper_bound(PNG_PROFILE_ACCEPT_BYTES)
-        if kind == b"IEND":
-            break
-        index = next_index
-    return 0
+    finally:
+        data = None
 
 
 def _jpeg_geometry_and_icc(data: bytes) -> tuple[tuple[int, int] | None, int]:
     """Width, height, and stored ICC byte count. Does not decode or inflate."""
-    sof = {
-        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
-    }
-    index = 2
-    size = None
-    icc = 0
-    limit = len(data)
-    while index + 4 <= limit:
-        if data[index] != 0xFF:
+    try:
+        sof = {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }
+        index = 2
+        size = None
+        icc = 0
+        limit = len(data)
+        while index + 4 <= limit:
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            while index < limit and data[index] == 0xFF:
+                index += 1
+            if index >= limit:
+                break
+            marker = data[index]
             index += 1
-            continue
-        while index < limit and data[index] == 0xFF:
-            index += 1
-        if index >= limit:
-            break
-        marker = data[index]
-        index += 1
-        if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
-            continue
-        if marker in {0xD9, 0xDA}:
-            break
-        if index + 2 > limit:
-            break
-        segment = int.from_bytes(data[index:index + 2], "big")
-        if segment < 2 or index + segment > limit:
-            break
-        payload_at = index + 2
-        payload_len = segment - 2
-        if marker == 0xE2 and payload_len >= 14 and data[payload_at:payload_at + 12] == b"ICC_PROFILE\x00":
-            icc += payload_len - 14
-        if marker in sof and size is None and payload_len >= 5:
-            height = int.from_bytes(data[payload_at + 1:payload_at + 3], "big")
-            width = int.from_bytes(data[payload_at + 3:payload_at + 5], "big")
-            if width > 0 and height > 0:
-                size = (width, height)
-        index += segment
-    return size, icc
+            if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                continue
+            if marker in {0xD9, 0xDA}:
+                break
+            if index + 2 > limit:
+                break
+            segment = int.from_bytes(data[index:index + 2], "big")
+            if segment < 2 or index + segment > limit:
+                break
+            payload_at = index + 2
+            payload_len = segment - 2
+            if marker == 0xE2 and payload_len >= 14 and data[payload_at:payload_at + 12] == b"ICC_PROFILE\x00":
+                icc += payload_len - 14
+            if marker in sof and size is None and payload_len >= 5:
+                height = int.from_bytes(data[payload_at + 1:payload_at + 3], "big")
+                width = int.from_bytes(data[payload_at + 3:payload_at + 5], "big")
+                if width > 0 and height > 0:
+                    size = (width, height)
+            index += segment
+        return size, icc
+    finally:
+        data = None
 
 
 def _webp_icc_length(data: bytes) -> int:
     """Stored ICCP payload length. Does not decode the bitstream."""
-    if not (data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP"):
-        return 0
-    index = 12
-    total = 0
-    while index + 8 <= len(data):
-        kind = data[index:index + 4]
-        length = int.from_bytes(data[index + 4:index + 8], "little")
-        payload = index + 8
-        if length < 0 or payload + length > len(data):
-            break
-        if kind == b"ICCP":
-            total += length
-        index = payload + length + (length & 1)
-    return total
+    try:
+        if not (data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP"):
+            return 0
+        index = 12
+        total = 0
+        while index + 8 <= len(data):
+            kind = data[index:index + 4]
+            length = int.from_bytes(data[index + 4:index + 8], "little")
+            payload = index + 8
+            if length < 0 or payload + length > len(data):
+                break
+            if kind == b"ICCP":
+                total += length
+            index = payload + length + (length & 1)
+        return total
+    finally:
+        data = None
 
 
 def output_png_cap(data: bytes) -> int | None:
@@ -1349,44 +1418,76 @@ def output_png_cap(data: bytes) -> int | None:
     JPEG and WebP profiles are measured from the bytes already in the file.
     A PNG iCCP is not inflated; the reserve is Pillow's accept cap.
     EXIF and text chunks are not copied into the composite, so they add nothing.
+    The ``data`` local is cleared before this frame is left on an exception.
     """
-    if data.startswith(b"\xff\xd8"):
-        size, icc = _jpeg_geometry_and_icc(data)
+    try:
+        return _output_png_cap(data)
+    finally:
+        data = None
+
+
+def _output_png_cap(data: bytes) -> int | None:
+    try:
+        return _output_png_cap_of(data)
+    finally:
+        data = None
+
+
+def _output_png_cap_of(data: bytes) -> int | None:
+    try:
+        return _output_png_cap_value(data)
+    finally:
+        data = None
+
+
+def _output_png_cap_value(data: bytes) -> int | None:
+    try:
+        if data.startswith(b"\xff\xd8"):
+            size, icc = _jpeg_geometry_and_icc(data)
+            if not size:
+                return None
+            extra = icc_chunk_upper_bound(icc) if icc > 0 else 0
+            return png_rgba_upper_bound(size[0], size[1], extra)
+        if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+            size = _sniff_webp(data)
+            if not size:
+                return None
+            icc = _webp_icc_length(data)
+            extra = icc_chunk_upper_bound(icc) if icc > 0 else 0
+            return png_rgba_upper_bound(size[0], size[1], extra)
+        size = sniff_image_size(data)
         if not size:
             return None
-        extra = icc_chunk_upper_bound(icc) if icc > 0 else 0
+        extra = png_ancillary_upper_bound(data) if data.startswith(b"\x89PNG\r\n\x1a\n") else 0
         return png_rgba_upper_bound(size[0], size[1], extra)
-    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
-        size = _sniff_webp(data)
-        if not size:
-            return None
-        icc = _webp_icc_length(data)
-        extra = icc_chunk_upper_bound(icc) if icc > 0 else 0
-        return png_rgba_upper_bound(size[0], size[1], extra)
-    size = sniff_image_size(data)
-    if not size:
-        return None
-    extra = png_ancillary_upper_bound(data) if data.startswith(b"\x89PNG\r\n\x1a\n") else 0
-    return png_rgba_upper_bound(size[0], size[1], extra)
+    finally:
+        data = None
 
 
 def composite_output_caps(images: object) -> list[int] | None:
     """Per-image PNG caps, or None when any size cannot be known from the header."""
-    caps: list[int] = []
-    entries = images if isinstance(images, (list, tuple)) else [images]
-    saw = False
-    for item in entries:
-        if not item:
-            continue
-        raw = item[0] if isinstance(item, tuple) else item
-        if not isinstance(raw, (bytes, bytearray)):
-            return None
-        cap = output_png_cap(bytes(raw))
-        if cap is None:
-            return None
-        saw = True
-        caps.append(cap)
-    return caps if saw else []
+    raw = None
+    item = None
+    try:
+        caps: list[int] = []
+        entries = images if isinstance(images, (list, tuple)) else [images]
+        saw = False
+        for item in entries:
+            if not item:
+                continue
+            raw = item[0] if isinstance(item, tuple) else item
+            if not isinstance(raw, (bytes, bytearray)):
+                return None
+            cap = output_png_cap(raw if isinstance(raw, bytes) else bytes(raw))
+            raw = None
+            if cap is None:
+                return None
+            saw = True
+            caps.append(cap)
+        return caps if saw else []
+    finally:
+        raw = None
+        item = None
 
 
 def composite_output_upper_bound(images: object) -> int | None:
