@@ -1128,6 +1128,48 @@ class EditBufferHold:
     def __init__(self) -> None:
         self.amount = 0
         self.released = False
+        self.native = 0
+        self.cancel = False
+        self._cleanup = None
+        self._finished = False
+
+    def enter_native(self) -> None:
+        """A close during this section must not drop the reservation."""
+        with _guard.cv:
+            if self.released or self.cancel:
+                raise LargeImageAdmissionError("cancelled")
+            self.native += 1
+
+    def leave_native(self) -> bool:
+        """Return True when this return should not start upstream."""
+        with _guard.cv:
+            if self.native > 0:
+                self.native -= 1
+            stop = self.cancel
+            finish = self.native == 0 and self.cancel and not self._finished
+        if finish:
+            self.finish()
+        return stop
+
+    def request_close(self, cleanup=None) -> None:
+        """Idempotent. A running native section keeps the bytes until it returns."""
+        with _guard.cv:
+            self.cancel = True
+            if cleanup is not None:
+                self._cleanup = cleanup
+            finish = self.native == 0 and not self._finished
+        if finish:
+            self.finish()
+
+    def finish(self) -> None:
+        with _guard.cv:
+            if self._finished or self.native > 0:
+                return
+            self._finished = True
+            cleanup = self._cleanup
+        if cleanup is not None:
+            cleanup()
+        self.release()
 
     def add(self, nbytes: int) -> None:
         nbytes = int(nbytes)
@@ -1197,31 +1239,64 @@ def base64_payload_length(nbytes: int) -> int:
     return ((nbytes + 2) // 3) * 4
 
 
-def png_rgba_upper_bound(width: int, height: int) -> int:
-    """Worst-case PNG bytes for one RGBA image.
+def _zlib_compress_bound(nbytes: int) -> int:
+    """zlib.compress upper bound for ``nbytes`` of input."""
+    nbytes = max(0, int(nbytes))
+    return nbytes + (nbytes >> 12) + (nbytes >> 14) + (nbytes >> 25) + 13
 
-    Composite writes RGBA. Each row is a filter byte plus four samples. zlib's
-    stored blocks are the expansion ceiling: a 2-byte header, 5 bytes for
-    every 65535-byte block, and a 4-byte checksum. The chunk wrappers cover
-    the signature, IHDR, one IDAT per stored block, and IEND.
+
+def png_rgba_upper_bound(width: int, height: int, extra: int = 0) -> int:
+    """Bytes reserved before Pillow writes one RGBA PNG.
+
+    The pixel payload is one filter byte plus four samples per row. Pillow
+    emits a separate IDAT chunk about every 64KiB, and each chunk costs 12
+    bytes. 64KiB of extra slack covers that wrapping and zlib's small
+    expansion on the sizes measured here. ``extra`` is ancillary data already
+    measured from the source, chiefly an iCCP profile.
     """
     width = int(width)
     height = int(height)
+    extra = max(0, int(extra))
     if width <= 0 or height <= 0:
-        return 0
+        return extra
     rows = height * (1 + width * 4)
-    blocks = (rows + 65534) // 65535
-    zlib_bytes = 2 + rows + blocks * 5 + 4
-    return 8 + 25 + (12 * blocks) + zlib_bytes + 12
+    idat_chunks = (rows + 65535) // 65536
+    return rows + 65536 + (12 * idat_chunks) + extra
+
+
+def icc_chunk_upper_bound(profile: bytes) -> int:
+    """PNG iCCP chunk Pillow writes for a profile of this length."""
+    zipped = _zlib_compress_bound(len(profile))
+    return 12 + len(b"ICC Profile") + 2 + zipped
+
+
+def png_ancillary_upper_bound(data: bytes) -> int:
+    """Ancillary bytes Pillow will copy out of this PNG, chiefly iCCP."""
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return 0
+    import zlib
+
+    index = 8
+    extra = 0
+    while index + 8 <= len(data):
+        length = int.from_bytes(data[index:index + 4], "big")
+        kind = data[index + 4:index + 8]
+        start = index + 8
+        chunk = data[start:start + length]
+        index = start + length + 4
+        if kind == b"iCCP" and len(chunk) > 2:
+            try:
+                profile = zlib.decompress(chunk.split(b"\x00", 1)[1][1:])
+            except Exception:
+                profile = chunk
+            extra += icc_chunk_upper_bound(profile if isinstance(profile, bytes) else chunk)
+        if kind == b"IEND":
+            break
+    return extra
 
 
 def composite_output_upper_bound(images: object) -> int | None:
-    """PNG bytes to reserve before a mask composite, or None if a size is unknown.
-
-    Unknown headers are not given a guessed multiple of the compressed length.
-    The caller discovers those dimensions inside the heavy permit and reserves
-    this same bound before saving.
-    """
+    """PNG bytes to reserve before a mask composite, or None if a size is unknown."""
     total = 0
     entries = images if isinstance(images, (list, tuple)) else [images]
     saw = False
@@ -1231,11 +1306,12 @@ def composite_output_upper_bound(images: object) -> int | None:
         raw = item[0] if isinstance(item, tuple) else item
         if not isinstance(raw, (bytes, bytearray)):
             return None
-        size = sniff_image_size(bytes(raw))
+        blob = bytes(raw)
+        size = sniff_image_size(blob)
         if not size:
             return None
         saw = True
-        total += png_rgba_upper_bound(size[0], size[1])
+        total += png_rgba_upper_bound(size[0], size[1], png_ancillary_upper_bound(blob))
     return total if saw else 0
 
 

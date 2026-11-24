@@ -3337,6 +3337,8 @@ class EditBufferBudgetTests(GuardTestCase):
             ("L", 64, 40, "L", 64, 40),
             ("RGB", 2, 85001, "L", 2, 85001),
             ("RGB", 400, 3, "RGBA", 20, 20),
+            ("RGB", 2048, 1024, "L", 2048, 1024),
+            ("L", 2048, 1024, "RGBA", 2048, 1024),
         ]
         for mode, width, height, mask_mode, mask_w, mask_h in cases:
             with self.subTest(mode=mode, size=(width, height)):
@@ -3379,6 +3381,142 @@ class EditBufferBudgetTests(GuardTestCase):
         self.assertEqual(called["n"], 0)
         self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
         self._assert_drained()
+
+    def test_stream_lease_survives_cancel_close_and_body_errors(self) -> None:
+        import weakref
+
+        import httpx
+        import main
+        from services.protocol.conversation import ImageGenerationError, ImageOutput
+        from services.protocol.openai_v1_image_edit import _EditStream, handle
+
+        image = _solid_png(3840, 2160)
+
+        def output(req, index, total):
+            return [ImageOutput(
+                kind="result", model=req.model, index=index, total=total,
+                data=[{"b64_json": "b2ZmbGluZQ=="}],
+            )]
+
+        # Real HTTP cancel while the stream body is running.
+        for n in (1, 4):
+            with self.subTest(phase="http_cancel", n=n):
+                reset_for_tests(enabled=True)
+                guard.configure_limits(max_generating=1)
+                entered = threading.Event()
+                release = threading.Event()
+                calls: list[int] = []
+                refs: list[weakref.ReferenceType] = []
+                original = _EditStream
+
+                def factory(*args, **kwargs):
+                    stream = original(*args, **kwargs)
+                    refs.append(weakref.ref(stream))
+                    return stream
+
+                def body(req, index, total):
+                    calls.append(index)
+                    entered.set()
+                    release.wait(timeout=6)
+                    return output(req, index, total)
+
+                async def scenario():
+                    with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                            mock.patch("services.protocol.conversation._generate_single_image_body", body), \
+                            mock.patch("services.protocol.openai_v1_image_edit._EditStream", factory):
+                        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                            task = asyncio.create_task(client.post(
+                                "/v1/images/edits",
+                                data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": str(n), "stream": "true"},
+                                files={"image": ("ref.png", image, "image/png")},
+                            ))
+                            try:
+                                self.assertTrue(await self._until(entered.is_set))
+                                self.assertGreater(guard.stats()["retained_edit_bytes"], 0)
+                                task.cancel()
+                                with self.assertRaises(asyncio.CancelledError):
+                                    await task
+                            finally:
+                                release.set()
+                            self.assertTrue(await self._until(lambda: guard.token_snapshot() == []))
+                            await client.get("/health?format=json")
+
+                try:
+                    asyncio.run(scenario())
+                finally:
+                    release.set()
+                self.assertEqual(calls, [1])
+                self.assertEqual(sum(ref() is not None for ref in refs), 0)
+                self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+                self._assert_drained()
+
+        # Close from another thread while encode is inside next().
+        reset_for_tests(enabled=True)
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        errors: list[str] = []
+
+        def encode(images):
+            entered.set()
+            release.wait(timeout=6)
+            return ["encoded"]
+
+        def blocked_body(req, index, total):
+            calls.append(index)
+            return output(req, index, total)
+
+        def run(stream) -> None:
+            try:
+                next(stream)
+            except BaseException as exc:
+                errors.append(type(exc).__name__)
+
+        with mock.patch("services.protocol.openai_v1_image_edit.encode_images", encode), \
+                mock.patch("services.protocol.conversation._generate_single_image_body", blocked_body):
+            stream = handle({
+                "prompt": "offline", "model": "gpt-image-2", "n": 1, "size": "2048x2048",
+                "stream": True, "images": [(image, "ref.png", "image/png")], "mask": [],
+            })
+            worker = threading.Thread(target=run, args=(stream,))
+            worker.start()
+            self.assertTrue(entered.wait(timeout=4))
+            self.assertGreater(guard.stats()["retained_edit_bytes"], 0)
+            self.assertEqual(guard.stats()["active"], 1)
+            stream.close()
+            self.assertGreater(guard.stats()["retained_edit_bytes"], 0)
+            self.assertEqual(guard.stats()["active"], 1)
+            release.set()
+            worker.join(timeout=6)
+        self.assertEqual(calls, [])
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self.assertEqual(guard.token_snapshot(), [])
+
+        # n=4 body errors must not leave base64 reachable from the exception.
+        for n in (1, 4):
+            with self.subTest(phase="body_error", n=n):
+                reset_for_tests(enabled=True)
+                refs: list[weakref.ReferenceType] = []
+
+                def failing(req, index, total):
+                    refs.append(weakref.ref(req))
+                    raise ImageGenerationError("offline synthetic failure", status_code=500, code="decode_failed")
+
+                saved = None
+                with mock.patch("services.protocol.conversation._generate_single_image_body", failing):
+                    try:
+                        handle({
+                            "prompt": "offline", "model": "gpt-image-2", "n": n, "size": "2048x2048",
+                            "stream": False, "images": [(image, "ref.png", "image/png")], "mask": [],
+                        })
+                    except BaseException as exc:
+                        saved = exc
+                self.assertIsInstance(saved, ImageGenerationError)
+                alive = [ref() for ref in refs if ref() is not None]
+                held = sum(sum(len(item) for item in (req.images or [])) for req in alive)
+                self.assertEqual(held, 0)
+                self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+                self._assert_drained()
 
     def test_reservation_is_a_hard_upper_bound(self) -> None:
         guard.configure_limits(max_retained_edit_bytes=1000)

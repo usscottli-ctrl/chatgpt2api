@@ -18,17 +18,36 @@ from services.protocol.conversation import (
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
-class _EditStream:
-    """Iterator whose close releases the edit budget even if it never starts.
+class _CappedBytesIO(BytesIO):
+    """PNG writer that cannot grow past the reservation."""
 
-    A generator's finally does not run when close() happens before the first
-    iteration. This wrapper owns that release, and it does not keep a
-    ContextVar token across yields.
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self._limit = int(limit)
+
+    def write(self, data: bytes) -> int:
+        if self.tell() + len(data) > self._limit:
+            self.seek(0)
+            self.truncate(0)
+            from services.free_large_image_guard import LargeImageAdmissionError
+
+            raise LargeImageAdmissionError("buffer_budget")
+        return super().write(data)
+
+
+class _EditStream:
+    """One edit stream and the buffer lease it owns.
+
+    close() is idempotent from any thread. It marks the lease cancelled and
+    releases immediately only when no native step is inside next(). A running
+    encode keeps the bytes until it returns, and that return does not start
+    upstream. Garbage collection uses the same close.
     """
 
-    def __init__(self, factory, release) -> None:
+    def __init__(self, factory, hold, cleanup) -> None:
         self._factory = factory
-        self._release = release
+        self._hold = hold
+        self._cleanup = cleanup
         self._gen = None
         self._closed = False
 
@@ -36,36 +55,28 @@ class _EditStream:
         return self
 
     def __next__(self):
-        if self._closed:
+        if self._closed and self._gen is None:
             raise StopIteration
-        if self._gen is None:
-            self._gen = self._factory()
+        self._hold.enter_native()
         try:
+            if self._gen is None:
+                self._gen = self._factory()
             return next(self._gen)
         except StopIteration:
-            self.close()
+            self._closed = True
             raise
-        except BaseException:
-            self.close()
-            raise
+        finally:
+            self._hold.leave_native()
 
     def close(self) -> None:
-        if self._closed:
-            return
         self._closed = True
-        gen = self._gen
-        self._gen = None
-        if gen is not None:
-            closer = getattr(gen, "close", None)
-            if closer is not None:
-                try:
-                    closer()
-                except Exception:
-                    pass
-        release = self._release
-        self._release = None
-        if release is not None:
-            release()
+        self._hold.request_close(self._cleanup)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _composite_mask(
@@ -93,9 +104,21 @@ def _composite_mask(
             alpha = mask_img.convert("L")
         alpha = alpha.resize(img.size, Image.LANCZOS)
         img.putalpha(alpha)
-        buf = BytesIO()
-        img.save(buf, format="PNG")
+        from services.free_large_image_guard import icc_chunk_upper_bound, png_rgba_upper_bound
+
+        icc = img.info.get("icc_profile") if isinstance(getattr(img, "info", None), dict) else None
+        extra = icc_chunk_upper_bound(icc) if isinstance(icc, (bytes, bytearray)) else 0
+        limit = png_rgba_upper_bound(img.size[0], img.size[1], extra)
+        buf = _CappedBytesIO(limit)
+        if isinstance(icc, (bytes, bytearray)):
+            img.save(buf, format="PNG", icc_profile=icc)
+        else:
+            img.save(buf, format="PNG")
         result.append((buf.getvalue(), filename, "image/png"))
+        for opened in (img, mask_img):
+            closer = getattr(opened, "close", None)
+            if closer is not None:
+                closer()
     return result
 
 
@@ -275,6 +298,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
             with gate:
                 if state["error"] is not None:
                     raise state["error"]
+                if hold is not None and hold.cancel:
+                    raise LargeImageAdmissionError("cancelled")
                 if not state["done"]:
                     try:
                         _prepare()
@@ -282,7 +307,11 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
                     except BaseException as exc:
                         state["error"] = exc
                         raise
-                request.images = list(encoded_images or [])
+                if hold is not None and hold.cancel:
+                    raise LargeImageAdmissionError("cancelled")
+                # Same list the lease clears. A copy would stay reachable from
+                # the request on an exception traceback.
+                request.images = encoded_images if isinstance(encoded_images, list) else []
 
         def _outputs():
             request = _request()
@@ -294,7 +323,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
                 yield from stream_image_chunks(_outputs())
 
             handed_off = True
-            return _EditStream(_chunks, _release)
+            return _EditStream(_chunks, hold, _release)
         result = _finish(_outputs())
         if not encoded_images:
             raise ImageGenerationError("image is required")
