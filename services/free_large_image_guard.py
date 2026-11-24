@@ -95,6 +95,14 @@ MAX_WAITING = MAX_HEAVY_WAITING
 MAX_GENERATING = MAX_ACTIVE * 4
 # 120s download timeout + 60s for one wave of decode/upscale/base64.
 WAIT_TIMEOUT_SECS = 180
+# Requests waiting for a claim before any upstream call. Not part of the 15
+# in-flight claims. 16 covers the observed 13-task burst and stays under the
+# default 40 worker threads, so 1K and health calls still have threads.
+MAX_ADMISSION_WAITING = 16
+# Sub2 keeps an accepted async task in "processing" while this HTTP call is
+# open, and its execution timeout is 30 minutes. 180s is long enough for the
+# in-flight wave to finish and short enough to leave the rest for generation.
+ADMISSION_WAIT_SECS = 180
 # Header sniff budget. Stops well before a full 2K/4K buffer is assembled.
 SNIFF_LIMIT = 256 * 1024
 # Only when dimensions cannot be read. Ordinary 1K payloads are smaller.
@@ -133,23 +141,31 @@ class _Guard:
         self.max_active = MAX_ACTIVE
         self.max_heavy_waiting = MAX_HEAVY_WAITING
         self.max_generating = MAX_GENERATING
+        self.max_admission_waiting = MAX_ADMISSION_WAITING
+        self.admission_wait_secs = ADMISSION_WAIT_SECS
         self.wait_timeout_secs = WAIT_TIMEOUT_SECS
+        self.epoch = 0
         self.threshold = LARGE_PIXEL_THRESHOLD
         self.active = 0
         self.heavy_waiting = 0
         self.generating = 0
+        self.admission_waiting = 0
         self.rejected = 0
         self.rejected_queue_full = 0
         self.rejected_generation_busy = 0
         self.rejected_handoff_full = 0
+        self.rejected_admission_full = 0
+        self.admission_timed_out = 0
         self.timed_out = 0
         self.cancelled = 0
         self.peak_active = 0
         self.peak_heavy_waiting = 0
         self.peak_generating = 0
+        self.peak_admission_waiting = 0
         self._next_id = 1
         self.tokens: dict[int, Token] = {}
         self.heavy_queue: deque[Token] = deque()
+        self.admission_queue: deque[Token] = deque()
 
     def stats(self) -> dict[str, Any]:
         with self.cv:
@@ -166,6 +182,9 @@ class _Guard:
                 "max_waiting": self.max_heavy_waiting,
                 "generating": self.generating,
                 "max_generating": self.max_generating,
+                "admission_waiting": self.admission_waiting,
+                "max_admission_waiting": self.max_admission_waiting,
+                "admission_wait_secs": self.admission_wait_secs,
                 "wait_timeout_secs": self.wait_timeout_secs,
                 "threshold_pixels": self.threshold,
                 "rejected": self.rejected,
@@ -173,12 +192,15 @@ class _Guard:
                 "rejected_queue_full": self.rejected_queue_full,
                 "rejected_generation_busy": self.rejected_generation_busy,
                 "rejected_handoff_full": self.rejected_handoff_full,
+                "rejected_admission_full": self.rejected_admission_full,
+                "admission_timed_out": self.admission_timed_out,
                 "timed_out": self.timed_out,
                 "cancelled": self.cancelled,
                 "peak_active": self.peak_active,
                 "peak_heavy_waiting": self.peak_heavy_waiting,
                 "peak_waiting": self.peak_heavy_waiting,
                 "peak_generating": self.peak_generating,
+                "peak_admission_waiting": self.peak_admission_waiting,
             }
 
     def reset(self, *, enabled: bool) -> None:
@@ -188,17 +210,23 @@ class _Guard:
             self.active = 0
             self.heavy_waiting = 0
             self.generating = 0
+            self.admission_waiting = 0
             self.rejected = 0
             self.rejected_queue_full = 0
             self.rejected_generation_busy = 0
             self.rejected_handoff_full = 0
+            self.rejected_admission_full = 0
+            self.admission_timed_out = 0
             self.timed_out = 0
             self.cancelled = 0
             self.peak_active = 0
             self.peak_heavy_waiting = 0
             self.peak_generating = 0
+            self.peak_admission_waiting = 0
+            self.epoch += 1
             self.tokens.clear()
             self.heavy_queue.clear()
+            self.admission_queue.clear()
             self.cv.notify_all()
 
 
@@ -543,6 +571,8 @@ def configure_limits(
     max_waiting: int | None = None,
     max_heavy_waiting: int | None = None,
     max_generating: int | None = None,
+    max_admission_waiting: int | None = None,
+    admission_wait_secs: float | None = None,
     wait_timeout_secs: float | None = None,
     threshold_pixels: int | None = None,
 ) -> None:
@@ -555,6 +585,10 @@ def configure_limits(
             _guard.max_heavy_waiting = max(0, int(max_waiting))
         if max_generating is not None:
             _guard.max_generating = max(1, int(max_generating))
+        if max_admission_waiting is not None:
+            _guard.max_admission_waiting = max(0, int(max_admission_waiting))
+        if admission_wait_secs is not None:
+            _guard.admission_wait_secs = max(0.0, float(admission_wait_secs))
         if wait_timeout_secs is not None:
             _guard.wait_timeout_secs = max(0.0, float(wait_timeout_secs))
         if threshold_pixels is not None:
@@ -566,6 +600,8 @@ def reset_for_tests(*, enabled: bool = False) -> None:
     _guard.max_active = MAX_ACTIVE
     _guard.max_heavy_waiting = MAX_HEAVY_WAITING
     _guard.max_generating = MAX_GENERATING
+    _guard.max_admission_waiting = MAX_ADMISSION_WAITING
+    _guard.admission_wait_secs = ADMISSION_WAIT_SECS
     _guard.wait_timeout_secs = WAIT_TIMEOUT_SECS
     _guard.threshold = LARGE_PIXEL_THRESHOLD
     stack = getattr(_tls, "stack", None)
@@ -959,6 +995,8 @@ def _reject(reason: str) -> None:
         _guard.rejected_generation_busy += 1
     elif reason == "handoff_full":
         _guard.rejected_handoff_full += 1
+    elif reason == "admission_full":
+        _guard.rejected_admission_full += 1
     logger.warning(
         "free_large_image reject reason=%s active=%s heavy_waiting=%s generating=%s",
         reason,
@@ -969,23 +1007,84 @@ def _reject(reason: str) -> None:
     raise LargeImageAdmissionError(reason)
 
 
-def _begin_generation() -> Token:
-    """Count an upstream large-image generation. Does not take a heavy slot.
+def _generation_block_reason_locked() -> str | None:
+    if _guard.heavy_waiting >= _guard.max_heavy_waiting:
+        return "queue_full"
+    if _occupied_locked() >= _pipeline_limit():
+        return "handoff_full"
+    if _guard.generating >= _guard.max_generating:
+        return "generation_busy"
+    return None
 
-    The job still consumes one handoff claim so it can become active or
-    heavy_waiting later without exceeding those caps or dropping the result.
+
+def _host_task_cancelled() -> bool:
+    """True when the HTTP task that owns this worker thread has been cancelled."""
+    try:
+        from anyio.from_thread import check_cancelled
+    except Exception:
+        return False
+    try:
+        check_cancelled()
+    except BaseException as exc:
+        return type(exc).__name__ in {"CancelledError", "Cancelled"}
+    return False
+
+
+def _drop_admission_waiter_locked(token: Token) -> None:
+    if token in _guard.admission_queue:
+        _guard.admission_queue.remove(token)
+    if token.state == "admission_waiting" and _guard.admission_waiting > 0:
+        _guard.admission_waiting -= 1
+    token.state = "done"
+    _guard.tokens.pop(token.id, None)
+
+
+def _begin_generation() -> Token:
+    """Take one generating claim, waiting in a bounded line when the 15 are full.
+
+    The wait does not count as generating, heavy waiting, or active, and it
+    holds no image bytes. Only the head starts upstream. A zero wait keeps the
+    old immediate rejection.
     """
     with _guard.cv:
-        if _guard.heavy_waiting >= _guard.max_heavy_waiting:
-            _reject("queue_full")
-        if _occupied_locked() >= _pipeline_limit():
-            _reject("handoff_full")
-        if _guard.generating >= _guard.max_generating:
-            _reject("generation_busy")
-        _guard.generating += 1
-        if _guard.generating > _guard.peak_generating:
-            _guard.peak_generating = _guard.generating
-        return _new_token("generating")
+        if _guard.admission_waiting >= _guard.max_admission_waiting:
+            _reject("admission_full")
+        token = _new_token("admission_waiting")
+        _guard.admission_waiting += 1
+        if _guard.admission_waiting > _guard.peak_admission_waiting:
+            _guard.peak_admission_waiting = _guard.admission_waiting
+        _guard.admission_queue.append(token)
+        epoch = _guard.epoch
+        deadline = time.monotonic() + _guard.admission_wait_secs
+        try:
+            while True:
+                if _guard.epoch != epoch:
+                    raise LargeImageAdmissionError("cancelled")
+                if token.cancelled or _host_task_cancelled():
+                    _guard.cancelled += 1
+                    raise LargeImageAdmissionError("cancelled")
+                if _guard.admission_queue and _guard.admission_queue[0] is token:
+                    blocked = _generation_block_reason_locked()
+                    if blocked is None:
+                        _guard.admission_queue.popleft()
+                        _guard.admission_waiting -= 1
+                        _guard.generating += 1
+                        if _guard.generating > _guard.peak_generating:
+                            _guard.peak_generating = _guard.generating
+                        token.state = "generating"
+                        return token
+                    if _guard.admission_wait_secs <= 0:
+                        _reject(blocked)
+                if time.monotonic() >= deadline:
+                    _guard.admission_timed_out += 1
+                    raise LargeImageAdmissionError("admission_timeout")
+                remaining = deadline - time.monotonic()
+                _guard.cv.wait(min(max(remaining, 0.0), 0.2))
+        except BaseException:
+            if _guard.epoch == epoch and token.state == "admission_waiting":
+                _drop_admission_waiter_locked(token)
+                _guard.cv.notify_all()
+            raise
 
 
 def _begin_heavy_waiter() -> Token:
@@ -1006,7 +1105,7 @@ def _begin_heavy_waiter() -> Token:
 def consistency() -> str | None:
     """Return a problem string when counters disagree with token states or caps."""
     with _guard.cv:
-        counts = {"generating": 0, "heavy_waiting": 0, "active": 0}
+        counts = {"generating": 0, "heavy_waiting": 0, "active": 0, "admission_waiting": 0}
         for token in _guard.tokens.values():
             if token.state == "heavy_gate":
                 return "hidden heavy_gate"
@@ -1020,6 +1119,8 @@ def consistency() -> str | None:
             return f"heavy_waiting counter tokens={counts['heavy_waiting']} counter={_guard.heavy_waiting}"
         if counts["active"] != _guard.active:
             return f"active counter tokens={counts['active']} counter={_guard.active}"
+        if counts["admission_waiting"] != _guard.admission_waiting:
+            return "admission_waiting counter"
         for token in _guard.tokens.values():
             if token.state == "done":
                 return "done token retained"
@@ -1034,6 +1135,12 @@ def consistency() -> str | None:
             return "queue length"
         if any(token.state == "generating" for token in _guard.heavy_queue):
             return "generating in queue"
+        if len(_guard.admission_queue) != _guard.admission_waiting:
+            return "admission queue length"
+        if any(token.state != "admission_waiting" for token in _guard.admission_queue):
+            return "admission queue state"
+        if _guard.admission_waiting > _guard.max_admission_waiting:
+            return "admission cap"
         if _guard.active > _guard.max_active:
             return "active cap"
         if _guard.heavy_waiting > _guard.max_heavy_waiting:

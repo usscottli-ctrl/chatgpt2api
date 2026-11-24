@@ -38,7 +38,12 @@ class GuardTestCase(unittest.TestCase):
     def setUp(self) -> None:
         os.environ.pop("CHATGPT2API_FREE_LARGE_IMAGE_GUARD", None)
         reset_for_tests(enabled=True)
-        guard.configure_limits(max_active=5, max_waiting=10, wait_timeout_secs=2.0)
+        guard.configure_limits(
+            max_active=5,
+            max_waiting=10,
+            wait_timeout_secs=2.0,
+            admission_wait_secs=0,
+        )
 
     def tearDown(self) -> None:
         os.environ.pop("CHATGPT2API_FREE_LARGE_IMAGE_GUARD", None)
@@ -48,6 +53,7 @@ class GuardTestCase(unittest.TestCase):
         self.assertEqual(stats["active"], 0, stats)
         self.assertEqual(stats["waiting"], 0, stats)
         self.assertEqual(stats["generating"], 0, stats)
+        self.assertEqual(stats["admission_waiting"], 0, stats)
         self.assertIsNone(problem, stats)
 
 
@@ -2357,6 +2363,252 @@ class PromotedOwnershipTests(GuardTestCase):
         self.assertEqual(guard.stats()["generating"], 0, guard.stats())
         self.assertEqual(guard.token_snapshot(), [], guard.token_snapshot())
         self.assertIsNone(guard.consistency(), guard.stats())
+
+    def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
+        return ConcurrencyTests._wait_until(self, predicate, timeout)
+
+
+class AdmissionWaitTests(GuardTestCase):
+    """Claim-full requests wait before upstream. The line is not a heavy claim."""
+
+    def test_sixteenth_waits_and_does_not_call_upstream_until_a_claim_frees(self) -> None:
+        guard.configure_limits(admission_wait_secs=3)
+        release = threading.Event()
+        started: list[int] = []
+        errors: list[BaseException] = []
+
+        def occupy() -> None:
+            try:
+                with guard.bind_large_image_job("3840x2160"):
+                    started.append(1)
+                    release.wait(timeout=3)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        holders = [threading.Thread(target=occupy, name=f"claim-{i}") for i in range(15)]
+        for thread in holders:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 15))
+        calls = {"body": 0}
+        entered = threading.Event()
+
+        def late() -> None:
+            try:
+                with guard.bind_large_image_job("3840x2160"):
+                    calls["body"] += 1
+                    entered.set()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        waiter = threading.Thread(target=late, name="waiter")
+        waiter.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["admission_waiting"] == 1))
+        self.assertEqual(calls["body"], 0)
+        self.assertEqual(guard.stats()["generating"], 15)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertEqual(guard.stats()["heavy_waiting"], 0)
+        self.assertIsNone(guard.consistency())
+        release.set()
+        self.assertTrue(entered.wait(timeout=3))
+        self.assertEqual(calls["body"], 1)
+        waiter.join(timeout=3)
+        for thread in holders:
+            thread.join(timeout=3)
+        self.assertFalse(errors, errors)
+        self._assert_drained()
+
+    def test_admission_full_timeout_cancel_and_restart_do_not_start_upstream(self) -> None:
+        guard.configure_limits(
+            max_active=1,
+            max_heavy_waiting=1,
+            max_generating=1,
+            max_admission_waiting=1,
+            admission_wait_secs=2,
+        )
+        release = threading.Event()
+        holder_started = threading.Event()
+
+        def hold() -> None:
+            with guard.bind_large_image_job("2K"):
+                holder_started.set()
+                release.wait(timeout=3)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(holder_started.wait(timeout=2))
+        queued = threading.Event()
+        outcome: list[str] = []
+
+        def wait_for_slot() -> None:
+            try:
+                with guard.bind_large_image_job("2K"):
+                    outcome.append("body")
+            except LargeImageAdmissionError as exc:
+                outcome.append(exc.reason)
+            queued.set()
+
+        first = threading.Thread(target=wait_for_slot)
+        first.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["admission_waiting"] == 1))
+        calls = {"body": 0}
+        with self.assertRaises(LargeImageAdmissionError) as full:
+            with guard.bind_large_image_job("4K"):
+                calls["body"] += 1
+        self.assertEqual(full.exception.reason, "admission_full")
+        self.assertEqual(calls["body"], 0)
+        self.assertEqual(guard.stats()["rejected_admission_full"], 1)
+        token_id = next(item["id"] for item in guard.token_snapshot() if item["state"] == "admission_waiting")
+        self.assertTrue(guard.cancel_token(token_id))
+        self.assertTrue(queued.wait(timeout=2))
+        self.assertEqual(outcome, ["cancelled"])
+        first.join(timeout=2)
+        release.set()
+        holder.join(timeout=2)
+
+        guard.configure_limits(admission_wait_secs=0.2)
+        release.clear()
+        holder_started.clear()
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(holder_started.wait(timeout=2))
+        timed: list[str] = []
+        body = {"n": 0}
+
+        def expire() -> None:
+            try:
+                with guard.bind_large_image_job("2K"):
+                    body["n"] += 1
+            except LargeImageAdmissionError as exc:
+                timed.append(exc.reason)
+
+        worker = threading.Thread(target=expire)
+        worker.start()
+        worker.join(timeout=2)
+        self.assertEqual(timed, ["admission_timeout"])
+        self.assertEqual(body["n"], 0)
+        self.assertGreaterEqual(guard.stats()["admission_timed_out"], 1)
+        release.set()
+        holder.join(timeout=2)
+
+        guard.configure_limits(admission_wait_secs=2)
+        release.clear()
+        holder_started.clear()
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(holder_started.wait(timeout=2))
+        restarted = {"body": 0, "reason": ""}
+
+        def stale() -> None:
+            try:
+                with guard.bind_large_image_job("2K"):
+                    restarted["body"] += 1
+            except LargeImageAdmissionError as exc:
+                restarted["reason"] = exc.reason
+
+        stale_thread = threading.Thread(target=stale)
+        stale_thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["admission_waiting"] == 1))
+        reset_for_tests(enabled=True)
+        guard.configure_limits(
+            max_active=1,
+            max_heavy_waiting=1,
+            max_generating=1,
+            admission_wait_secs=0,
+        )
+        stale_thread.join(timeout=2)
+        self.assertEqual(restarted["body"], 0)
+        self.assertEqual(restarted["reason"], "cancelled")
+        release.set()
+        holder.join(timeout=2)
+        self._assert_drained()
+
+    def test_fifo_and_parallel_n_do_not_deadlock_or_double_start(self) -> None:
+        guard.configure_limits(
+            max_active=1,
+            max_heavy_waiting=1,
+            max_generating=2,
+            admission_wait_secs=3,
+        )
+        order: list[int] = []
+        lock = threading.Lock()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        def job(index: int) -> None:
+            try:
+                with guard.bind_large_image_job("3840x2160"):
+                    with lock:
+                        order.append(index)
+                    release.wait(timeout=3)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=job, args=(i,), name=f"n-{i}") for i in range(4)]
+        for thread in threads:
+            thread.start()
+            time.sleep(0.02)
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 2))
+        self.assertEqual(order, [0, 1])
+        self.assertGreaterEqual(guard.stats()["admission_waiting"], 1)
+        self.assertLessEqual(guard.stats()["generating"], 2)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertFalse(errors, errors)
+        self.assertEqual(order, [0, 1, 2, 3])
+        self._assert_drained()
+
+    def test_cancelled_http_task_does_not_start_upstream(self) -> None:
+        import anyio
+
+        guard.configure_limits(
+            max_active=1,
+            max_heavy_waiting=1,
+            max_generating=1,
+            admission_wait_secs=3,
+        )
+        release = threading.Event()
+
+        def hold() -> None:
+            with guard.bind_large_image_job("2K"):
+                release.wait(timeout=3)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 1))
+        body = {"n": 0}
+
+        async def main() -> None:
+            async with anyio.create_task_group() as group:
+                async def waiter() -> None:
+                    def blocking() -> None:
+                        try:
+                            with guard.bind_large_image_job("2K"):
+                                body["n"] += 1
+                        except LargeImageAdmissionError:
+                            return
+
+                    await anyio.to_thread.run_sync(blocking)
+
+                group.start_soon(waiter)
+                await anyio.sleep(0.3)
+                group.cancel_scope.cancel()
+
+        anyio.run(main)
+        self.assertEqual(body["n"], 0)
+        self.assertEqual(guard.stats()["admission_waiting"], 0)
+        release.set()
+        holder.join(timeout=2)
+        self._assert_drained()
+
+    def _assert_drained(self) -> None:
+        self.assertEqual(guard.stats()["admission_waiting"], 0, guard.stats())
+        self.assertEqual(guard.stats()["generating"], 0, guard.stats())
+        self.assertEqual(guard.stats()["active"], 0, guard.stats())
+        self.assertEqual(guard.stats()["heavy_waiting"], 0, guard.stats())
+        self.assertEqual(guard.token_snapshot(), [])
+        self.assertIsNone(guard.consistency())
 
     def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
         return ConcurrencyTests._wait_until(self, predicate, timeout)
