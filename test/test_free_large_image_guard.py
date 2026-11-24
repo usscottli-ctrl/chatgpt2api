@@ -54,6 +54,7 @@ class GuardTestCase(unittest.TestCase):
         self.assertEqual(stats["waiting"], 0, stats)
         self.assertEqual(stats["generating"], 0, stats)
         self.assertEqual(stats["admission_waiting"], 0, stats)
+        self.assertEqual(stats["retained_edit_bytes"], 0, stats)
         self.assertIsNone(problem, stats)
 
 
@@ -3163,6 +3164,334 @@ class RealRequestAdmissionTests(GuardTestCase):
 
     def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
         return ConcurrencyTests._wait_until(self, predicate, timeout)
+
+
+class EditBufferBudgetTests(GuardTestCase):
+    """Queued edit payloads are bounded by reserved bytes, not by waiter count."""
+
+    def test_reservation_is_a_hard_upper_bound(self) -> None:
+        guard.configure_limits(max_retained_edit_bytes=1000)
+        first = guard.reserve_edit_buffers(600)
+        second = guard.reserve_edit_buffers(400)
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 1000)
+        self.assertLessEqual(guard.stats()["retained_edit_bytes"], guard.stats()["max_retained_edit_bytes"])
+        with self.assertRaises(LargeImageAdmissionError) as caught:
+            guard.reserve_edit_buffers(1)
+        self.assertEqual(caught.exception.reason, "buffer_budget")
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 1000)
+        self.assertEqual(guard.stats()["rejected_buffer_budget"], 1)
+        first.release_amount(100)
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 900)
+        first.release()
+        second.release()
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self.assertIsNone(guard.consistency())
+
+    def test_queued_n4_keeps_raw_bytes_until_a_child_is_admitted(self) -> None:
+        import httpx
+        import main
+        from services.protocol import openai_v1_image_edit as edit
+        from services.protocol.conversation import ImageOutput
+
+        raw = _png(3840, 2160) + os.urandom(2048)
+        self.assertGreater(len(set(raw[-256:])), 16)
+        encoded_need = guard.base64_payload_length(len(raw))
+        reset_for_tests(enabled=True)
+        guard.configure_limits(
+            admission_wait_secs=3,
+            max_retained_edit_bytes=len(raw) + encoded_need,
+        )
+        release = threading.Event()
+        encoded = {"n": 0}
+        calls: list[int] = []
+        held_while_queued: list[int] = []
+
+        def hold() -> None:
+            with guard.bind_large_image_job("2K"):
+                release.wait(timeout=6)
+
+        holders = [threading.Thread(target=hold) for _ in range(15)]
+        for thread in holders:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 15))
+
+        def encode(images):
+            encoded["n"] += 1
+            held_while_queued.append(guard.stats()["retained_edit_bytes"])
+            return ["encoded"]
+
+        def body(req, index, total):
+            calls.append(index)
+            return [ImageOutput(
+                kind="result", model=req.model, index=index, total=total,
+                data=[{"b64_json": "b2ZmbGluZQ=="}],
+            )]
+
+        async def scenario():
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch.object(edit, "encode_images", encode), \
+                    mock.patch.object(edit, "_composite_mask", lambda images, masks: images), \
+                    mock.patch("services.protocol.conversation._generate_single_image_body", body):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    task = asyncio.create_task(client.post(
+                        "/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": "4", "stream": "false"},
+                        files={"image": ("entropy.png", raw, "image/png")},
+                    ))
+                    try:
+                        self.assertTrue(await self._until(lambda: guard.stats()["admission_waiting"] == 4))
+                        self.assertEqual(encoded["n"], 0)
+                        self.assertEqual(calls, [])
+                        self.assertEqual(guard.stats()["retained_edit_bytes"], len(raw))
+                        overflow_raw = raw + os.urandom(encoded_need)
+                        overflow = await client.post(
+                            "/v1/images/edits",
+                            data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": "1", "stream": "false"},
+                            files={"image": ("entropy.png", overflow_raw, "image/png")},
+                        )
+                        self.assertEqual(overflow.status_code, 429, overflow.text)
+                        self.assertEqual(overflow.json()["error"]["code"], "free_large_image_buffer_budget")
+                        self.assertEqual(guard.stats()["admission_waiting"], 4)
+                        self.assertEqual(encoded["n"], 0)
+                        release.set()
+                        for thread in holders:
+                            thread.join(timeout=2)
+                        response = await asyncio.wait_for(task, 4)
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(len(response.json()["data"]), 4)
+                        self.assertEqual(encoded["n"], 1)
+                        self.assertEqual(sorted(calls), [1, 2, 3, 4])
+                        self.assertEqual(held_while_queued, [len(raw) + encoded_need])
+                    finally:
+                        release.set()
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            release.set()
+            for thread in holders:
+                thread.join(timeout=2)
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self._assert_drained()
+
+    def test_masks_and_extra_references_do_not_decode_past_the_budget(self) -> None:
+        import httpx
+        import main
+        from services.protocol import openai_v1_image_edit as edit
+
+        images = [(_png(3840, 2160) + os.urandom(128), f"ref-{index}.png", "image/png") for index in range(3)]
+        masks = [(_png(64, 64) + os.urandom(64), f"mask-{index}.png", "image/png") for index in range(2)]
+        raw_bytes = sum(len(item[0]) for item in images) + sum(len(item[0]) for item in masks)
+        opened = {"n": 0}
+
+        def open_image(*_args, **_kwargs):
+            opened["n"] += 1
+            raise AssertionError("decode started")
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_retained_edit_bytes=raw_bytes + 32)
+
+        async def scenario():
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch.object(edit.Image, "open", open_image):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    def upload(item):
+                        return (item[1], item[0], item[2])
+
+                    return await client.post(
+                        "/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": "1", "stream": "false"},
+                        files=[
+                            ("image", upload(images[0])),
+                            ("image", upload(images[1])),
+                            ("image", upload(images[2])),
+                            ("mask", upload(masks[0])),
+                            ("mask", upload(masks[1])),
+                        ],
+                    )
+
+        response = asyncio.run(scenario())
+        self.assertEqual(response.status_code, 429, response.text)
+        self.assertEqual(response.json()["error"]["code"], "free_large_image_buffer_budget")
+        self.assertEqual(opened["n"], 0)
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self.assertEqual(guard.stats()["active"], 0)
+
+    def test_cancel_timeout_exception_partial_and_stream_release_the_budget(self) -> None:
+        import httpx
+        import main
+        from services.protocol import openai_v1_image_edit as edit
+        from services.protocol.conversation import ImageGenerationError, ImageOutput
+
+        raw = _png(3840, 2160) + os.urandom(512)
+
+        def image_body(req, index, total):
+            return [ImageOutput(
+                kind="result", model=req.model, index=index, total=total,
+                data=[{"b64_json": "b2ZmbGluZQ=="}],
+            )]
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(admission_wait_secs=0.2, max_retained_edit_bytes=len(raw) + 10_000)
+        release = threading.Event()
+
+        def hold() -> None:
+            with guard.bind_large_image_job("2K"):
+                release.wait(timeout=4)
+
+        holders = [threading.Thread(target=hold) for _ in range(15)]
+        for thread in holders:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 15))
+
+        async def timed_out():
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch.object(edit, "encode_images", lambda images: (_ for _ in ()).throw(AssertionError("encoded"))):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    response = await client.post(
+                        "/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": "4", "stream": "false"},
+                        files={"image": ("entropy.png", raw, "image/png")},
+                    )
+            return response
+
+        try:
+            response = asyncio.run(timed_out())
+            self.assertEqual(response.status_code, 429, response.text)
+            self.assertEqual(response.json()["error"]["code"], "free_large_image_admission_timeout")
+            self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        finally:
+            release.set()
+            for thread in holders:
+                thread.join(timeout=2)
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(admission_wait_secs=3, max_retained_edit_bytes=len(raw) + 10_000)
+        release = threading.Event()
+        holders = [threading.Thread(target=hold) for _ in range(15)]
+        for thread in holders:
+            thread.start()
+        self.assertTrue(self._wait_until(lambda: guard.stats()["generating"] == 15))
+
+        async def cancelled():
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    task = asyncio.create_task(client.post(
+                        "/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": "4", "stream": "false"},
+                        files={"image": ("entropy.png", raw, "image/png")},
+                    ))
+                    try:
+                        self.assertTrue(await self._until(lambda: guard.stats()["admission_waiting"] == 4))
+                        self.assertEqual(guard.stats()["retained_edit_bytes"], len(raw))
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                        self.assertTrue(await self._until(lambda: guard.stats()["retained_edit_bytes"] == 0))
+                    finally:
+                        release.set()
+
+        try:
+            asyncio.run(cancelled())
+        finally:
+            release.set()
+            for thread in holders:
+                thread.join(timeout=2)
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_retained_edit_bytes=len(raw) + guard.base64_payload_length(len(raw)))
+        encoded = {"n": 0}
+        calls: list[int] = []
+
+        def encode(images):
+            encoded["n"] += 1
+            return ["encoded"]
+
+        def mixed(req, index, total):
+            calls.append(index)
+            if index == 2:
+                raise ImageGenerationError("decode failed", status_code=500, error_type="server_error", code="decode_failed")
+            return image_body(req, index, total)
+
+        async def partial():
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch.object(edit, "encode_images", encode), \
+                    mock.patch("services.protocol.conversation._generate_single_image_body", mixed):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    return await client.post(
+                        "/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": "4", "stream": "false"},
+                        files={"image": ("entropy.png", raw, "image/png")},
+                    )
+
+        response = asyncio.run(partial())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["data"]), 3)
+        self.assertEqual(encoded["n"], 1)
+        self.assertEqual(sorted(calls), [1, 2, 3, 4])
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_retained_edit_bytes=len(raw) + guard.base64_payload_length(len(raw)))
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("upstream body failed")
+
+        async def failed():
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch.object(edit, "encode_images", lambda images: ["encoded"]), \
+                    mock.patch("services.protocol.conversation._generate_single_image_body", explode):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    return await client.post(
+                        "/v1/images/edits",
+                        data={"model": "gpt-image-2", "prompt": "offline", "size": "2048x2048", "n": "1", "stream": "false"},
+                        files={"image": ("entropy.png", raw, "image/png")},
+                    )
+
+        response = asyncio.run(failed())
+        self.assertGreaterEqual(response.status_code, 500)
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_retained_edit_bytes=len(raw) + guard.base64_payload_length(len(raw)))
+        from services.protocol.openai_v1_image_edit import handle
+
+        with mock.patch.object(edit, "encode_images", lambda images: ["encoded"]), \
+                mock.patch("services.protocol.conversation._generate_single_image_body", image_body):
+            stream = handle({
+                "prompt": "offline",
+                "model": "gpt-image-2",
+                "n": 1,
+                "size": "2048x2048",
+                "stream": True,
+                "images": [(raw, "entropy.png", "image/png")],
+                "mask": [],
+            })
+            self.assertEqual(guard.stats()["retained_edit_bytes"], len(raw))
+            first = next(stream)
+            self.assertIn("b64_json", str(first))
+            stream.close()
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self._assert_drained()
+
+    def _wait_until(self, predicate, timeout: float = 2.0) -> bool:
+        return ConcurrencyTests._wait_until(self, predicate, timeout)
+
+    async def _until(self, predicate, timeout: float = 3.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(0.005)
+        return bool(predicate())
+
+    def _assert_drained(self) -> None:
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self.assertEqual(guard.stats()["admission_waiting"], 0)
+        self.assertEqual(guard.stats()["generating"], 0)
+        self.assertEqual(guard.stats()["active"], 0)
+        self.assertIsNone(guard.consistency())
 
 
 class _StreamingBackend:

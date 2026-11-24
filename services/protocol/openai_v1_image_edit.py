@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from io import BytesIO
 from typing import Any, Iterator
 
@@ -54,26 +55,51 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     masks = body.get("mask") or []
     from services.free_large_image_guard import (
         LargeImageAdmissionError,
+        base64_payload_length,
+        bind_edit_prepare,
         bind_large_image_job,
+        composite_output_upper_bound,
         edit_input_guard_pixels,
         heavy_image_work,
         is_enabled,
+        payload_byte_length,
         raise_if_request_cancelled,
+        reserve_edit_buffers,
+        reset_edit_prepare,
     )
     from services.protocol.conversation import _admission_error_code
 
     guard_pixels = edit_input_guard_pixels(images, masks)
+    hold = None
 
     def _prepare() -> None:
         nonlocal images, encoded_images
         if guard_pixels:
             with heavy_image_work(discovered_pixels=guard_pixels, stage="edit_input"):
-                images = _composite_mask(images, masks)
-                # Composite may already be inside a native call. Do not start
-                # encode when the request died during that call.
+                if masks and hold is not None:
+                    upper = composite_output_upper_bound(images)
+                    hold.add(upper)
+                    produced = _composite_mask(images, masks)
+                    actual = payload_byte_length(produced)
+                    if actual > upper:
+                        produced = None
+                        raise LargeImageAdmissionError("buffer_budget")
+                    hold.release_amount(upper - actual)
+                    previous = images
+                    images = produced
+                    previous = None
+                    del previous
+                else:
+                    images = _composite_mask(images, masks)
                 raise_if_request_cancelled()
+                if hold is not None:
+                    encoded_need = 0
+                    for item in images or []:
+                        raw = item[0] if isinstance(item, tuple) and item else b""
+                        if raw:
+                            encoded_need += base64_payload_length(len(raw))
+                    hold.add(encoded_need)
                 encoded_images = encode_images(images)
-            # Encode is not interruptible. Observe cancel before any upstream.
             raise_if_request_cancelled()
         else:
             images = _composite_mask(images, masks)
@@ -113,31 +139,89 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
             progress_callback=progress_callback,
         )
 
-    # A large or unproven input waits for one claim before decode. The raw
-    # upload is already buffered by the framework; the decoded image is not
-    # built while this request is only waiting. n=1 keeps that same claim
-    # through generation. n>1 releases it before the per-image claims so the
-    # parent slot cannot deadlock the children.
-    if guard_pixels and is_enabled():
-        try:
-            if n == 1 and not body.get("stream"):
-                with bind_large_image_job("4K"):
-                    _prepare()
-                    if not encoded_images:
-                        raise ImageGenerationError("image is required")
-                    return _finish(stream_image_outputs_with_pool(_request()))
+    # Uploads are already in memory before this function. A large edit reserves
+    # those bytes before it waits. Decode and base64 are reserved immediately
+    # before they are created, and only after a claim is held, so a child that
+    # is still waiting does not keep an encoded copy. n=1 non-stream keeps one
+    # claim through generation. n>1 and stream encode once inside the first
+    # child claim so the parent claim cannot deadlock the children.
+    def _clear_payload() -> None:
+        nonlocal images, encoded_images
+        images = []
+        encoded_images = None
+        body["images"] = []
+        body["mask"] = []
+
+    def _busy(exc: LargeImageAdmissionError) -> ImageGenerationError:
+        return ImageGenerationError(
+            "Free-pool large-image capacity is busy. Retry this same request later; "
+            "do not start a duplicate generation.",
+            status_code=429,
+            error_type="rate_limit_error",
+            code=_admission_error_code(exc.reason),
+        )
+
+    if not (guard_pixels and is_enabled()):
+        _prepare()
+        if not encoded_images:
+            raise ImageGenerationError("image is required")
+        return _finish(stream_image_outputs_with_pool(_request()))
+
+    try:
+        hold = reserve_edit_buffers(payload_byte_length(images) + payload_byte_length(masks))
+    except LargeImageAdmissionError as exc:
+        _clear_payload()
+        raise _busy(exc) from exc
+
+    def _release() -> None:
+        _clear_payload()
+        if hold is not None:
+            hold.release()
+
+    try:
+        if n == 1 and not body.get("stream"):
             with bind_large_image_job("4K"):
                 _prepare()
-        except LargeImageAdmissionError as exc:
-            raise ImageGenerationError(
-                "Free-pool large-image capacity is busy. Retry this same request later; "
-                "do not start a duplicate generation.",
-                status_code=429,
-                error_type="rate_limit_error",
-                code=_admission_error_code(exc.reason),
-            ) from exc
-    else:
-        _prepare()
-    if not encoded_images:
-        raise ImageGenerationError("image is required")
-    return _finish(stream_image_outputs_with_pool(_request()))
+                if not encoded_images:
+                    raise ImageGenerationError("image is required")
+                return _finish(stream_image_outputs_with_pool(_request()))
+
+        gate = threading.Lock()
+        state: dict[str, Any] = {"done": False, "error": None}
+
+        def _prepare_once() -> None:
+            with gate:
+                if state["error"] is not None:
+                    raise state["error"]
+                if state["done"]:
+                    return
+                try:
+                    _prepare()
+                    state["done"] = True
+                except BaseException as exc:
+                    state["error"] = exc
+                    raise
+
+        if body.get("stream"):
+            def _stream():
+                prepare_token = bind_edit_prepare(_prepare_once)
+                try:
+                    yield from stream_image_chunks(stream_image_outputs_with_pool(_request()))
+                finally:
+                    reset_edit_prepare(prepare_token)
+                    _release()
+
+            return _stream()
+        prepare_token = bind_edit_prepare(_prepare_once)
+        try:
+            result = _finish(stream_image_outputs_with_pool(_request()))
+        finally:
+            reset_edit_prepare(prepare_token)
+        if not encoded_images:
+            raise ImageGenerationError("image is required")
+        return result
+    except LargeImageAdmissionError as exc:
+        raise _busy(exc) from exc
+    finally:
+        if not body.get("stream"):
+            _release()

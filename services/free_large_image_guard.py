@@ -100,6 +100,10 @@ WAIT_TIMEOUT_SECS = 180
 # in-flight claims. 16 covers the observed 13-task burst and stays under the
 # default 40 worker threads, so 1K and health calls still have threads.
 MAX_ADMISSION_WAITING = 16
+# Bytes this process may still reference for edit payloads. Five RGBA frames
+# match the heavy slots that may be decoding at once. The extra 16MiB is
+# slack for one in-flight base64, not a 16-item queue and not the 4GiB cgroup.
+MAX_RETAINED_EDIT_BYTES = 3840 * 2160 * 4 * MAX_ACTIVE + 16 * 1024 * 1024
 # Sub2 keeps an accepted async task in "processing" while this HTTP call is
 # open, and its execution timeout is 30 minutes. 180s is long enough for the
 # in-flight wave to finish and short enough to leave the rest for generation.
@@ -147,6 +151,7 @@ class _Guard:
         self.max_heavy_waiting = MAX_HEAVY_WAITING
         self.max_generating = MAX_GENERATING
         self.max_admission_waiting = MAX_ADMISSION_WAITING
+        self.max_retained_edit_bytes = MAX_RETAINED_EDIT_BYTES
         self.admission_wait_secs = ADMISSION_WAIT_SECS
         self.wait_timeout_secs = WAIT_TIMEOUT_SECS
         self.epoch = 0
@@ -155,11 +160,13 @@ class _Guard:
         self.heavy_waiting = 0
         self.generating = 0
         self.admission_waiting = 0
+        self.retained_edit_bytes = 0
         self.rejected = 0
         self.rejected_queue_full = 0
         self.rejected_generation_busy = 0
         self.rejected_handoff_full = 0
         self.rejected_admission_full = 0
+        self.rejected_buffer_budget = 0
         self.admission_timed_out = 0
         self.timed_out = 0
         self.cancelled = 0
@@ -167,6 +174,7 @@ class _Guard:
         self.peak_heavy_waiting = 0
         self.peak_generating = 0
         self.peak_admission_waiting = 0
+        self.peak_retained_edit_bytes = 0
         self._next_id = 1
         self.tokens: dict[int, Token] = {}
         self.heavy_queue: deque[Token] = deque()
@@ -190,6 +198,9 @@ class _Guard:
                 "admission_waiting": self.admission_waiting,
                 "max_admission_waiting": self.max_admission_waiting,
                 "admission_wait_secs": self.admission_wait_secs,
+                "retained_edit_bytes": self.retained_edit_bytes,
+                "max_retained_edit_bytes": self.max_retained_edit_bytes,
+                "peak_retained_edit_bytes": self.peak_retained_edit_bytes,
                 "wait_timeout_secs": self.wait_timeout_secs,
                 "threshold_pixels": self.threshold,
                 "rejected": self.rejected,
@@ -198,6 +209,7 @@ class _Guard:
                 "rejected_generation_busy": self.rejected_generation_busy,
                 "rejected_handoff_full": self.rejected_handoff_full,
                 "rejected_admission_full": self.rejected_admission_full,
+                "rejected_buffer_budget": self.rejected_buffer_budget,
                 "admission_timed_out": self.admission_timed_out,
                 "timed_out": self.timed_out,
                 "cancelled": self.cancelled,
@@ -206,6 +218,7 @@ class _Guard:
                 "peak_waiting": self.peak_heavy_waiting,
                 "peak_generating": self.peak_generating,
                 "peak_admission_waiting": self.peak_admission_waiting,
+                "peak_retained_edit_bytes": self.peak_retained_edit_bytes,
             }
 
     def reset(self, *, enabled: bool) -> None:
@@ -216,11 +229,13 @@ class _Guard:
             self.heavy_waiting = 0
             self.generating = 0
             self.admission_waiting = 0
+            self.retained_edit_bytes = 0
             self.rejected = 0
             self.rejected_queue_full = 0
             self.rejected_generation_busy = 0
             self.rejected_handoff_full = 0
             self.rejected_admission_full = 0
+            self.rejected_buffer_budget = 0
             self.admission_timed_out = 0
             self.timed_out = 0
             self.cancelled = 0
@@ -228,6 +243,7 @@ class _Guard:
             self.peak_heavy_waiting = 0
             self.peak_generating = 0
             self.peak_admission_waiting = 0
+            self.peak_retained_edit_bytes = 0
             self.epoch += 1
             self.tokens.clear()
             self.heavy_queue.clear()
@@ -597,6 +613,7 @@ def configure_limits(
     max_heavy_waiting: int | None = None,
     max_generating: int | None = None,
     max_admission_waiting: int | None = None,
+    max_retained_edit_bytes: int | None = None,
     admission_wait_secs: float | None = None,
     wait_timeout_secs: float | None = None,
     threshold_pixels: int | None = None,
@@ -612,6 +629,8 @@ def configure_limits(
             _guard.max_generating = max(1, int(max_generating))
         if max_admission_waiting is not None:
             _guard.max_admission_waiting = max(0, int(max_admission_waiting))
+        if max_retained_edit_bytes is not None:
+            _guard.max_retained_edit_bytes = max(0, int(max_retained_edit_bytes))
         if admission_wait_secs is not None:
             _guard.admission_wait_secs = max(0.0, float(admission_wait_secs))
         if wait_timeout_secs is not None:
@@ -626,6 +645,7 @@ def reset_for_tests(*, enabled: bool = False) -> None:
     _guard.max_heavy_waiting = MAX_HEAVY_WAITING
     _guard.max_generating = MAX_GENERATING
     _guard.max_admission_waiting = MAX_ADMISSION_WAITING
+    _guard.max_retained_edit_bytes = MAX_RETAINED_EDIT_BYTES
     _guard.admission_wait_secs = ADMISSION_WAIT_SECS
     _guard.wait_timeout_secs = WAIT_TIMEOUT_SECS
     _guard.threshold = LARGE_PIXEL_THRESHOLD
@@ -1076,6 +1096,132 @@ def raise_if_request_cancelled() -> None:
     raise LargeImageAdmissionError("cancelled")
 
 
+_edit_prepare: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "free_large_image_edit_prepare",
+    default=None,
+)
+
+
+def bind_edit_prepare(callback: Any) -> contextvars.Token:
+    """Run ``callback`` once inside the child claim, before upstream."""
+    return _edit_prepare.set(callback)
+
+
+def reset_edit_prepare(token: contextvars.Token) -> None:
+    _edit_prepare.reset(token)
+
+
+def run_edit_prepare() -> None:
+    callback = _edit_prepare.get()
+    if callback is not None:
+        callback()
+
+
+class EditBufferHold:
+    """Reservation for edit bytes this request still references.
+
+    ``amount`` is the exact number of payload bytes counted for this request:
+    raw uploads, retained composite outputs, and base64. It is not process RSS
+    and it does not include a Pillow image that composite has already released.
+    """
+
+    def __init__(self) -> None:
+        self.amount = 0
+        self.released = False
+
+    def add(self, nbytes: int) -> None:
+        nbytes = int(nbytes)
+        if nbytes <= 0 or self.released:
+            return
+        with _guard.cv:
+            if self.released:
+                return
+            if _guard.retained_edit_bytes + nbytes > _guard.max_retained_edit_bytes:
+                _guard.rejected += 1
+                _guard.rejected_buffer_budget += 1
+                raise LargeImageAdmissionError("buffer_budget")
+            _guard.retained_edit_bytes += nbytes
+            self.amount += nbytes
+            if _guard.retained_edit_bytes > _guard.peak_retained_edit_bytes:
+                _guard.peak_retained_edit_bytes = _guard.retained_edit_bytes
+
+    def release_amount(self, nbytes: int) -> None:
+        nbytes = int(nbytes)
+        if nbytes <= 0 or self.released or self.amount <= 0:
+            return
+        nbytes = min(nbytes, self.amount)
+        with _guard.cv:
+            if self.released:
+                return
+            nbytes = min(nbytes, self.amount)
+            self.amount -= nbytes
+            _guard.retained_edit_bytes -= nbytes
+
+    def release(self) -> None:
+        with _guard.cv:
+            if self.released:
+                return
+            self.released = True
+            _guard.retained_edit_bytes -= self.amount
+            self.amount = 0
+
+
+def reserve_edit_buffers(nbytes: int) -> EditBufferHold:
+    """Count ``nbytes`` before this request waits or allocates further copies."""
+    hold = EditBufferHold()
+    try:
+        hold.add(nbytes)
+    except BaseException:
+        hold.release()
+        raise
+    return hold
+
+
+def payload_byte_length(items: object) -> int:
+    total = 0
+    entries = items if isinstance(items, (list, tuple)) else [items]
+    for item in entries:
+        if not item:
+            continue
+        raw = item[0] if isinstance(item, tuple) else item
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            total += len(raw)
+    return total
+
+
+def base64_payload_length(nbytes: int) -> int:
+    """Exact ``base64.b64encode`` length with no newlines."""
+    nbytes = int(nbytes)
+    if nbytes <= 0:
+        return 0
+    return ((nbytes + 2) // 3) * 4
+
+
+def composite_output_upper_bound(images: object) -> int:
+    """Bytes reserved before a mask composite, per image we are about to write.
+
+    A known header reserves one RGBA frame plus 64KiB of encoder slack. An
+    unknown header reserves eight times the bytes already held, which is the
+    only size that can be proved before Pillow runs. The caller must drop any
+    output larger than this instead of keeping it.
+    """
+    total = 0
+    entries = images if isinstance(images, (list, tuple)) else [images]
+    for item in entries:
+        if not item:
+            continue
+        raw = item[0] if isinstance(item, tuple) else item
+        if not isinstance(raw, (bytes, bytearray)):
+            total += 65536
+            continue
+        size = sniff_image_size(bytes(raw))
+        if size:
+            total += size[0] * size[1] * 4 + 65536
+        else:
+            total += max(len(raw), 1) * 8 + 65536
+    return total
+
+
 def _host_task_cancelled() -> bool:
     """True when the HTTP task that owns this worker thread has been cancelled."""
     try:
@@ -1201,6 +1347,8 @@ def consistency() -> str | None:
             return "admission queue state"
         if _guard.admission_waiting > _guard.max_admission_waiting:
             return "admission cap"
+        if _guard.retained_edit_bytes < 0 or _guard.retained_edit_bytes > _guard.max_retained_edit_bytes:
+            return "retained edit bytes"
         if _guard.active > _guard.max_active:
             return "active cap"
         if _guard.heavy_waiting > _guard.max_heavy_waiting:

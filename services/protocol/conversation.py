@@ -1353,6 +1353,7 @@ def _admission_error_code(reason: str) -> str:
         "queue_timeout": "free_large_image_queue_timeout",
         "admission_full": "free_large_image_admission_full",
         "admission_timeout": "free_large_image_admission_timeout",
+        "buffer_budget": "free_large_image_buffer_budget",
     }.get(reason, "free_large_image_busy")
 
 
@@ -1366,10 +1367,17 @@ def _generate_single_image(
     The waiting slot is process-local and is not the per-account concurrency
     limit. Polling an accepted async task does not enter this function again.
     """
-    from services.free_large_image_guard import LargeImageAdmissionError, bind_large_image_job
+    from services.free_large_image_guard import (
+        LargeImageAdmissionError,
+        bind_large_image_job,
+        raise_if_request_cancelled,
+        run_edit_prepare,
+    )
 
     try:
         with bind_large_image_job(request.size):
+            run_edit_prepare()
+            raise_if_request_cancelled()
             return _generate_single_image_body(request, index, total)
     except LargeImageAdmissionError as exc:
         raise ImageGenerationError(
