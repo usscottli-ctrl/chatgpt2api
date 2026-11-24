@@ -70,9 +70,11 @@ cap of 5 on every large generation, and it is not Sub2 group #44.
 from __future__ import annotations
 
 import base64
+import contextvars
 import importlib.util
 import logging
 import os
+import sys
 import threading
 import time
 from collections import deque
@@ -95,6 +97,18 @@ MAX_WAITING = MAX_HEAVY_WAITING
 MAX_GENERATING = MAX_ACTIVE * 4
 # 120s download timeout + 60s for one wave of decode/upscale/base64.
 WAIT_TIMEOUT_SECS = 180
+# Requests waiting for a claim before any upstream call. Not part of the 15
+# in-flight claims. 16 covers the observed 13-task burst and stays under the
+# default 40 worker threads, so 1K and health calls still have threads.
+MAX_ADMISSION_WAITING = 16
+# Bytes this process may still reference for edit payloads. Five RGBA frames
+# match the heavy slots that may be decoding at once. The extra 16MiB is
+# slack for one in-flight base64, not a 16-item queue and not the 4GiB cgroup.
+MAX_RETAINED_EDIT_BYTES = 3840 * 2160 * 4 * MAX_ACTIVE + 16 * 1024 * 1024
+# Sub2 keeps an accepted async task in "processing" while this HTTP call is
+# open, and its execution timeout is 30 minutes. 180s is long enough for the
+# in-flight wave to finish and short enough to leave the rest for generation.
+ADMISSION_WAIT_SECS = 180
 # Header sniff budget. Stops well before a full 2K/4K buffer is assembled.
 SNIFF_LIMIT = 256 * 1024
 # Only when dimensions cannot be read. Ordinary 1K payloads are smaller.
@@ -109,6 +123,10 @@ _OFF = {"0", "false", "off", "no", "disabled"}
 _ON = {"1", "true", "on", "yes", "free"}
 
 _tls = threading.local()
+_request_cancel: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "free_large_image_request_cancel",
+    default=None,
+)
 
 
 class LargeImageAdmissionError(Exception):
@@ -133,23 +151,35 @@ class _Guard:
         self.max_active = MAX_ACTIVE
         self.max_heavy_waiting = MAX_HEAVY_WAITING
         self.max_generating = MAX_GENERATING
+        self.max_admission_waiting = MAX_ADMISSION_WAITING
+        self.max_retained_edit_bytes = MAX_RETAINED_EDIT_BYTES
+        self.admission_wait_secs = ADMISSION_WAIT_SECS
         self.wait_timeout_secs = WAIT_TIMEOUT_SECS
+        self.epoch = 0
         self.threshold = LARGE_PIXEL_THRESHOLD
         self.active = 0
         self.heavy_waiting = 0
         self.generating = 0
+        self.admission_waiting = 0
+        self.retained_edit_bytes = 0
         self.rejected = 0
         self.rejected_queue_full = 0
         self.rejected_generation_busy = 0
         self.rejected_handoff_full = 0
+        self.rejected_admission_full = 0
+        self.rejected_buffer_budget = 0
+        self.admission_timed_out = 0
         self.timed_out = 0
         self.cancelled = 0
         self.peak_active = 0
         self.peak_heavy_waiting = 0
         self.peak_generating = 0
+        self.peak_admission_waiting = 0
+        self.peak_retained_edit_bytes = 0
         self._next_id = 1
         self.tokens: dict[int, Token] = {}
         self.heavy_queue: deque[Token] = deque()
+        self.admission_queue: deque[Token] = deque()
 
     def stats(self) -> dict[str, Any]:
         with self.cv:
@@ -166,6 +196,12 @@ class _Guard:
                 "max_waiting": self.max_heavy_waiting,
                 "generating": self.generating,
                 "max_generating": self.max_generating,
+                "admission_waiting": self.admission_waiting,
+                "max_admission_waiting": self.max_admission_waiting,
+                "admission_wait_secs": self.admission_wait_secs,
+                "retained_edit_bytes": self.retained_edit_bytes,
+                "max_retained_edit_bytes": self.max_retained_edit_bytes,
+                "peak_retained_edit_bytes": self.peak_retained_edit_bytes,
                 "wait_timeout_secs": self.wait_timeout_secs,
                 "threshold_pixels": self.threshold,
                 "rejected": self.rejected,
@@ -173,12 +209,17 @@ class _Guard:
                 "rejected_queue_full": self.rejected_queue_full,
                 "rejected_generation_busy": self.rejected_generation_busy,
                 "rejected_handoff_full": self.rejected_handoff_full,
+                "rejected_admission_full": self.rejected_admission_full,
+                "rejected_buffer_budget": self.rejected_buffer_budget,
+                "admission_timed_out": self.admission_timed_out,
                 "timed_out": self.timed_out,
                 "cancelled": self.cancelled,
                 "peak_active": self.peak_active,
                 "peak_heavy_waiting": self.peak_heavy_waiting,
                 "peak_waiting": self.peak_heavy_waiting,
                 "peak_generating": self.peak_generating,
+                "peak_admission_waiting": self.peak_admission_waiting,
+                "peak_retained_edit_bytes": self.peak_retained_edit_bytes,
             }
 
     def reset(self, *, enabled: bool) -> None:
@@ -188,17 +229,26 @@ class _Guard:
             self.active = 0
             self.heavy_waiting = 0
             self.generating = 0
+            self.admission_waiting = 0
+            self.retained_edit_bytes = 0
             self.rejected = 0
             self.rejected_queue_full = 0
             self.rejected_generation_busy = 0
             self.rejected_handoff_full = 0
+            self.rejected_admission_full = 0
+            self.rejected_buffer_budget = 0
+            self.admission_timed_out = 0
             self.timed_out = 0
             self.cancelled = 0
             self.peak_active = 0
             self.peak_heavy_waiting = 0
             self.peak_generating = 0
+            self.peak_admission_waiting = 0
+            self.peak_retained_edit_bytes = 0
+            self.epoch += 1
             self.tokens.clear()
             self.heavy_queue.clear()
+            self.admission_queue.clear()
             self.cv.notify_all()
 
 
@@ -218,6 +268,7 @@ class Token:
         self.stage = ""
         self.fail_reason = ""
         self.owner_ident = 0
+        self.resume_as_generating = False
 
     def _is_owner(self) -> bool:
         return self.owner_ident != 0 and threading.get_ident() == self.owner_ident
@@ -360,6 +411,18 @@ class Token:
         guard.tokens.pop(self.id, None)
         guard.cv.notify_all()
 
+    def _request_cancel_before_arm_locked(self) -> None:
+        """Drop a claim that has not armed when this HTTP request is already gone.
+
+        The permit inside an armed section stays with that thread. This does
+        not run while ``work_running`` is set, so a decode or encode that has
+        started is not cut off from another thread.
+        """
+        if self.work_running or not _request_cancel_is_set():
+            return
+        self._abandon_locked("cancelled")
+        raise LargeImageAdmissionError("cancelled")
+
     def _reap_cancelled_head_locked(self) -> bool:
         guard = self.guard
         if not guard.heavy_queue:
@@ -418,11 +481,16 @@ class Token:
         with guard.cv:
             if not self._is_owner():
                 raise LargeImageAdmissionError("foreign_thread")
+            if self.state == "generating":
+                # This claim continues after the heavy section so the same
+                # thread can generate without taking a second one.
+                self.resume_as_generating = True
             if self.state == "done":
                 raise LargeImageAdmissionError(self.fail_reason or "cancelled")
             if self.state == "active" and self.work_running:
                 self.depth += 1
                 return
+            self._request_cancel_before_arm_locked()
             if self.cancelled and not self.work_running:
                 self._abandon_locked("cancelled")
                 raise LargeImageAdmissionError("cancelled")
@@ -435,6 +503,7 @@ class Token:
             self.stage = stage
             try:
                 while self.state != "active":
+                    self._request_cancel_before_arm_locked()
                     if self.state == "done":
                         raise LargeImageAdmissionError(self.fail_reason or "cancelled")
                     if self.cancelled and self.state in {"generating", "heavy_waiting"}:
@@ -459,7 +528,8 @@ class Token:
                     if remaining <= 0:
                         self._abandon_locked("queue_timeout")
                         raise LargeImageAdmissionError("queue_timeout")
-                    guard.cv.wait(remaining)
+                    guard.cv.wait(min(remaining, 0.2))
+                self._request_cancel_before_arm_locked()
                 self._arm_active_locked()
             except BaseException as exc:
                 if self.state in {"generating", "heavy_waiting"}:
@@ -488,12 +558,12 @@ class Token:
             self.work_running = False
             if guard.active > 0:
                 guard.active -= 1
-            if self.closed:
-                self.state = "done"
-                guard.tokens.pop(self.id, None)
+            if self.resume_as_generating and not self.closed:
+                guard.generating += 1
+                if guard.generating > guard.peak_generating:
+                    guard.peak_generating = guard.generating
+                self.state = "generating"
             else:
-                # The heavy section is over. The task is no longer generating
-                # or waiting; close() is idempotent if it runs next.
                 self.state = "done"
                 guard.tokens.pop(self.id, None)
             guard.cv.notify_all()
@@ -543,6 +613,9 @@ def configure_limits(
     max_waiting: int | None = None,
     max_heavy_waiting: int | None = None,
     max_generating: int | None = None,
+    max_admission_waiting: int | None = None,
+    max_retained_edit_bytes: int | None = None,
+    admission_wait_secs: float | None = None,
     wait_timeout_secs: float | None = None,
     threshold_pixels: int | None = None,
 ) -> None:
@@ -555,6 +628,12 @@ def configure_limits(
             _guard.max_heavy_waiting = max(0, int(max_waiting))
         if max_generating is not None:
             _guard.max_generating = max(1, int(max_generating))
+        if max_admission_waiting is not None:
+            _guard.max_admission_waiting = max(0, int(max_admission_waiting))
+        if max_retained_edit_bytes is not None:
+            _guard.max_retained_edit_bytes = max(0, int(max_retained_edit_bytes))
+        if admission_wait_secs is not None:
+            _guard.admission_wait_secs = max(0.0, float(admission_wait_secs))
         if wait_timeout_secs is not None:
             _guard.wait_timeout_secs = max(0.0, float(wait_timeout_secs))
         if threshold_pixels is not None:
@@ -566,6 +645,9 @@ def reset_for_tests(*, enabled: bool = False) -> None:
     _guard.max_active = MAX_ACTIVE
     _guard.max_heavy_waiting = MAX_HEAVY_WAITING
     _guard.max_generating = MAX_GENERATING
+    _guard.max_admission_waiting = MAX_ADMISSION_WAITING
+    _guard.max_retained_edit_bytes = MAX_RETAINED_EDIT_BYTES
+    _guard.admission_wait_secs = ADMISSION_WAIT_SECS
     _guard.wait_timeout_secs = WAIT_TIMEOUT_SECS
     _guard.threshold = LARGE_PIXEL_THRESHOLD
     stack = getattr(_tls, "stack", None)
@@ -959,6 +1041,8 @@ def _reject(reason: str) -> None:
         _guard.rejected_generation_busy += 1
     elif reason == "handoff_full":
         _guard.rejected_handoff_full += 1
+    elif reason == "admission_full":
+        _guard.rejected_admission_full += 1
     logger.warning(
         "free_large_image reject reason=%s active=%s heavy_waiting=%s generating=%s",
         reason,
@@ -969,23 +1053,534 @@ def _reject(reason: str) -> None:
     raise LargeImageAdmissionError(reason)
 
 
-def _begin_generation() -> Token:
-    """Count an upstream large-image generation. Does not take a heavy slot.
+def _generation_block_reason_locked() -> str | None:
+    if _guard.heavy_waiting >= _guard.max_heavy_waiting:
+        return "queue_full"
+    if _occupied_locked() >= _pipeline_limit():
+        return "handoff_full"
+    if _guard.generating >= _guard.max_generating:
+        return "generation_busy"
+    return None
 
-    The job still consumes one handoff claim so it can become active or
-    heavy_waiting later without exceeding those caps or dropping the result.
+
+def attach_request_cancel(event: threading.Event) -> contextvars.Token:
+    """Publish the inbound HTTP request's cancel signal to worker threads."""
+    return _request_cancel.set(event)
+
+
+def reset_request_cancel(token: contextvars.Token) -> None:
+    _request_cancel.reset(token)
+
+
+def request_cancel_is_set() -> bool:
+    """True when the inbound HTTP request has been cancelled or disconnected."""
+    return _request_cancel_is_set()
+
+
+def _request_cancel_is_set() -> bool:
+    """True when the inbound image request has been cancelled or disconnected.
+
+    A Sub2 poll is a different HTTP call and does not set this event.
+    """
+    event = _request_cancel.get()
+    if event is not None and event.is_set():
+        return True
+    return _host_task_cancelled()
+
+
+def raise_if_request_cancelled() -> None:
+    """Stop before the next decode, encode, or upstream call.
+
+    This does not release a permit. A section that is already inside an armed
+    permit returns it only when that native step returns. A step that has not
+    started must not start.
+    """
+    if not _request_cancel_is_set():
+        return
+    with _guard.cv:
+        _guard.cancelled += 1
+    raise LargeImageAdmissionError("cancelled")
+
+
+class EditBufferHold:
+    """Reservation for edit bytes this request still references.
+
+    ``amount`` is the exact number of payload bytes counted for this request:
+    raw uploads, retained composite outputs, and base64. It is not process RSS
+    and it does not include a Pillow image that composite has already released.
+    """
+
+    def __init__(self) -> None:
+        self.amount = 0
+        self.released = False
+        self.native = 0
+        self.cancel = False
+        self._cleanup = None
+        self._finished = False
+
+    def enter_native(self) -> None:
+        """A close during this section must not drop the reservation."""
+        with _guard.cv:
+            if self.released or self.cancel:
+                raise LargeImageAdmissionError("cancelled")
+            self.native += 1
+
+    def leave_native(self) -> bool:
+        """Return True when this return should not start upstream."""
+        with _guard.cv:
+            if self.native > 0:
+                self.native -= 1
+            stop = self.cancel
+            finish = self.native == 0 and self.cancel and not self._finished
+        if finish:
+            self.finish()
+        return stop
+
+    def request_close(self, cleanup=None) -> None:
+        """Idempotent. A running native section keeps the bytes until it returns."""
+        with _guard.cv:
+            self.cancel = True
+            if cleanup is not None:
+                self._cleanup = cleanup
+            finish = self.native == 0 and not self._finished
+        if finish:
+            self.finish()
+
+    def finish(self) -> None:
+        with _guard.cv:
+            if self._finished or self.native > 0:
+                return
+            self._finished = True
+            cleanup = self._cleanup
+        if cleanup is not None:
+            cleanup()
+        self.release()
+
+    def add(self, nbytes: int) -> None:
+        nbytes = int(nbytes)
+        if nbytes <= 0 or self.released:
+            return
+        with _guard.cv:
+            if self.released:
+                return
+            if _guard.retained_edit_bytes + nbytes > _guard.max_retained_edit_bytes:
+                _guard.rejected += 1
+                _guard.rejected_buffer_budget += 1
+                raise LargeImageAdmissionError("buffer_budget")
+            _guard.retained_edit_bytes += nbytes
+            self.amount += nbytes
+            if _guard.retained_edit_bytes > _guard.peak_retained_edit_bytes:
+                _guard.peak_retained_edit_bytes = _guard.retained_edit_bytes
+
+    def release_amount(self, nbytes: int) -> None:
+        nbytes = int(nbytes)
+        if nbytes <= 0 or self.released or self.amount <= 0:
+            return
+        nbytes = min(nbytes, self.amount)
+        with _guard.cv:
+            if self.released:
+                return
+            nbytes = min(nbytes, self.amount)
+            self.amount -= nbytes
+            _guard.retained_edit_bytes -= nbytes
+
+    def release(self) -> None:
+        with _guard.cv:
+            if self.released:
+                return
+            self.released = True
+            _guard.retained_edit_bytes -= self.amount
+            self.amount = 0
+
+
+def reserve_edit_buffers(nbytes: int) -> EditBufferHold:
+    """Count ``nbytes`` before this request waits or allocates further copies."""
+    hold = EditBufferHold()
+    try:
+        hold.add(nbytes)
+    except BaseException:
+        hold.release()
+        raise
+    return hold
+
+
+def _stack_frame_ids() -> set[int]:
+    """Frame ids on any thread's stack right now.
+
+    ``sys._current_frames`` plus ``f_back`` is the check used before a write.
+    A frame in this set is left unchanged. A frame absent from it is treated
+    as finished. This does not claim the classification stays true after the
+    check returns.
+    """
+    found: set[int] = set()
+    for frame in sys._current_frames().values():
+        while frame is not None:
+            found.add(id(frame))
+            frame = frame.f_back
+    return found
+
+
+def drop_traceback_payloads(exc: BaseException, payloads: set[int]) -> None:
+    """Drop direct locals that are these exact payload objects on finished frames.
+
+    A frame that is on any thread's stack is not written. The same bytes
+    object may still be cleared from a different frame that has already
+    returned. The exception, traceback lines, and every other local stay.
+    A finished frame whose name cannot be cleared by assignment loses that
+    frame's locals. This is not a process-wide out-of-memory handler.
+    """
+    import types
+
+    seen: set[int] = set()
+    pending: list[object] = [exc]
+    while pending:
+        obj = pending.pop()
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, BaseException):
+            pending.extend((obj.__traceback__, obj.__cause__, obj.__context__))
+            continue
+        if isinstance(obj, dict):
+            pending.extend(obj.values())
+            continue
+        if isinstance(obj, (list, tuple)):
+            pending.extend(obj)
+            continue
+        if not isinstance(obj, types.TracebackType):
+            continue
+        pending.append(obj.tb_next)
+        frame = obj.tb_frame
+        try:
+            pairs = list(frame.f_locals.items())
+        except Exception:
+            continue
+        for _key, value in pairs:
+            if isinstance(value, (BaseException, types.TracebackType, dict, list, tuple)):
+                pending.append(value)
+        if id(frame) in _stack_frame_ids():
+            continue
+        writable = frame.f_locals
+        held = False
+        for key, value in pairs:
+            if id(value) not in payloads:
+                continue
+            held = True
+            writable[key] = None
+        if not held or id(frame) in _stack_frame_ids():
+            continue
+        try:
+            still = any(id(value) in payloads for value in list(frame.f_locals.values()))
+        except Exception:
+            still = False
+        if still and id(frame) not in _stack_frame_ids():
+            frame.clear()
+
+
+def payload_byte_length(items: object) -> int:
+    total = 0
+    entries = items if isinstance(items, (list, tuple)) else [items]
+    for item in entries:
+        if not item:
+            continue
+        raw = item[0] if isinstance(item, tuple) else item
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            total += len(raw)
+    return total
+
+
+def base64_payload_length(nbytes: int) -> int:
+    """Exact ``base64.b64encode`` length with no newlines."""
+    nbytes = int(nbytes)
+    if nbytes <= 0:
+        return 0
+    return ((nbytes + 2) // 3) * 4
+
+
+def _zlib_compress_bound(nbytes: int) -> int:
+    """zlib.compress upper bound for ``nbytes`` of input."""
+    nbytes = max(0, int(nbytes))
+    return nbytes + (nbytes >> 12) + (nbytes >> 14) + (nbytes >> 25) + 13
+
+
+def png_rgba_upper_bound(width: int, height: int, extra: int = 0) -> int:
+    """Bytes reserved before Pillow writes one RGBA PNG.
+
+    The pixel payload is one filter byte plus four samples per row. Pillow
+    emits a separate IDAT chunk about every 64KiB, and each chunk costs 12
+    bytes. 64KiB of extra slack covers that wrapping and zlib's small
+    expansion on the sizes measured here. ``extra`` is ancillary data already
+    measured from the source, chiefly an iCCP profile.
+    """
+    width = int(width)
+    height = int(height)
+    extra = max(0, int(extra))
+    if width <= 0 or height <= 0:
+        return extra
+    rows = height * (1 + width * 4)
+    idat_chunks = (rows + 65535) // 65536
+    return rows + 65536 + (12 * idat_chunks) + extra
+
+
+# Pillow's PNG reader refuses an inflated iCCP above ImageFile.SAFEBLOCK.
+PNG_PROFILE_ACCEPT_BYTES = 1024 * 1024
+
+
+def icc_chunk_upper_bound(profile_len: int) -> int:
+    """PNG iCCP chunk Pillow writes for a profile of this length. No inflate."""
+    zipped = _zlib_compress_bound(int(profile_len))
+    return 12 + len(b"ICC Profile") + 2 + zipped
+
+
+def png_ancillary_upper_bound(data: bytes) -> int:
+    """Reserve one output iCCP when the source has an iCCP chunk.
+
+    Chunk headers are read only. The compressed length is not the accept
+    limit: Pillow accepts a decompressed profile of ``PNG_PROFILE_ACCEPT_BYTES``
+    even when zlib stores it slightly larger. One such output profile is
+    reserved, and a profile Pillow will refuse is rejected by Pillow's reader.
+    """
+    try:
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return 0
+        index = 8
+        while index + 12 <= len(data):
+            length = int.from_bytes(data[index:index + 4], "big")
+            kind = data[index + 4:index + 8]
+            next_index = index + 12 + length
+            if length < 0 or next_index > len(data):
+                break
+            if kind == b"iCCP":
+                return icc_chunk_upper_bound(PNG_PROFILE_ACCEPT_BYTES)
+            if kind == b"IEND":
+                break
+            index = next_index
+        return 0
+    finally:
+        data = None
+
+
+def _jpeg_geometry_and_icc(data: bytes) -> tuple[tuple[int, int] | None, int]:
+    """Width, height, and stored ICC byte count. Does not decode or inflate."""
+    try:
+        sof = {
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+            0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+        }
+        index = 2
+        size = None
+        icc = 0
+        limit = len(data)
+        while index + 4 <= limit:
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            while index < limit and data[index] == 0xFF:
+                index += 1
+            if index >= limit:
+                break
+            marker = data[index]
+            index += 1
+            if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                continue
+            if marker in {0xD9, 0xDA}:
+                break
+            if index + 2 > limit:
+                break
+            segment = int.from_bytes(data[index:index + 2], "big")
+            if segment < 2 or index + segment > limit:
+                break
+            payload_at = index + 2
+            payload_len = segment - 2
+            if marker == 0xE2 and payload_len >= 14 and data[payload_at:payload_at + 12] == b"ICC_PROFILE\x00":
+                icc += payload_len - 14
+            if marker in sof and size is None and payload_len >= 5:
+                height = int.from_bytes(data[payload_at + 1:payload_at + 3], "big")
+                width = int.from_bytes(data[payload_at + 3:payload_at + 5], "big")
+                if width > 0 and height > 0:
+                    size = (width, height)
+            index += segment
+        return size, icc
+    finally:
+        data = None
+
+
+def _webp_icc_length(data: bytes) -> int:
+    """Stored ICCP payload length. Does not decode the bitstream."""
+    try:
+        if not (data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP"):
+            return 0
+        index = 12
+        total = 0
+        while index + 8 <= len(data):
+            kind = data[index:index + 4]
+            length = int.from_bytes(data[index + 4:index + 8], "little")
+            payload = index + 8
+            if length < 0 or payload + length > len(data):
+                break
+            if kind == b"ICCP":
+                total += length
+            index = payload + length + (length & 1)
+        return total
+    finally:
+        data = None
+
+
+def output_png_cap(data: bytes) -> int | None:
+    """Bytes to reserve before Pillow writes this image as an RGBA PNG.
+
+    JPEG and WebP profiles are measured from the bytes already in the file.
+    A PNG iCCP is not inflated; the reserve is Pillow's accept cap.
+    EXIF and text chunks are not copied into the composite, so they add nothing.
+    The ``data`` local is cleared before this frame is left on an exception.
+    """
+    try:
+        return _output_png_cap(data)
+    finally:
+        data = None
+
+
+def _output_png_cap(data: bytes) -> int | None:
+    try:
+        return _output_png_cap_of(data)
+    finally:
+        data = None
+
+
+def _output_png_cap_of(data: bytes) -> int | None:
+    try:
+        return _output_png_cap_value(data)
+    finally:
+        data = None
+
+
+def _output_png_cap_value(data: bytes) -> int | None:
+    try:
+        if data.startswith(b"\xff\xd8"):
+            size, icc = _jpeg_geometry_and_icc(data)
+            if not size:
+                return None
+            extra = icc_chunk_upper_bound(icc) if icc > 0 else 0
+            return png_rgba_upper_bound(size[0], size[1], extra)
+        if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+            size = _sniff_webp(data)
+            if not size:
+                return None
+            icc = _webp_icc_length(data)
+            extra = icc_chunk_upper_bound(icc) if icc > 0 else 0
+            return png_rgba_upper_bound(size[0], size[1], extra)
+        size = sniff_image_size(data)
+        if not size:
+            return None
+        extra = png_ancillary_upper_bound(data) if data.startswith(b"\x89PNG\r\n\x1a\n") else 0
+        return png_rgba_upper_bound(size[0], size[1], extra)
+    finally:
+        data = None
+
+
+def composite_output_caps(images: object) -> list[int] | None:
+    """Per-image PNG caps, or None when any size cannot be known from the header."""
+    raw = None
+    item = None
+    try:
+        caps: list[int] = []
+        entries = images if isinstance(images, (list, tuple)) else [images]
+        saw = False
+        for item in entries:
+            if not item:
+                continue
+            raw = item[0] if isinstance(item, tuple) else item
+            if not isinstance(raw, (bytes, bytearray)):
+                return None
+            cap = output_png_cap(raw if isinstance(raw, bytes) else bytes(raw))
+            raw = None
+            if cap is None:
+                return None
+            saw = True
+            caps.append(cap)
+        return caps if saw else []
+    finally:
+        raw = None
+        item = None
+
+
+def composite_output_upper_bound(images: object) -> int | None:
+    """PNG bytes to reserve before a mask composite, or None if a size is unknown."""
+    caps = composite_output_caps(images)
+    if caps is None:
+        return None
+    return sum(caps)
+
+
+def _host_task_cancelled() -> bool:
+    """True when the HTTP task that owns this worker thread has been cancelled."""
+    try:
+        from anyio.from_thread import check_cancelled
+    except Exception:
+        return False
+    try:
+        check_cancelled()
+    except BaseException as exc:
+        return type(exc).__name__ in {"CancelledError", "Cancelled"}
+    return False
+
+
+def _drop_admission_waiter_locked(token: Token) -> None:
+    if token in _guard.admission_queue:
+        _guard.admission_queue.remove(token)
+    if token.state == "admission_waiting" and _guard.admission_waiting > 0:
+        _guard.admission_waiting -= 1
+    token.state = "done"
+    _guard.tokens.pop(token.id, None)
+
+
+def _begin_generation() -> Token:
+    """Take one generating claim, waiting in a bounded line when the 15 are full.
+
+    The wait does not count as generating, heavy waiting, or active, and it
+    holds no image bytes. Only the head starts upstream. A zero wait keeps the
+    old immediate rejection.
     """
     with _guard.cv:
-        if _guard.heavy_waiting >= _guard.max_heavy_waiting:
-            _reject("queue_full")
-        if _occupied_locked() >= _pipeline_limit():
-            _reject("handoff_full")
-        if _guard.generating >= _guard.max_generating:
-            _reject("generation_busy")
-        _guard.generating += 1
-        if _guard.generating > _guard.peak_generating:
-            _guard.peak_generating = _guard.generating
-        return _new_token("generating")
+        if _guard.admission_waiting >= _guard.max_admission_waiting:
+            _reject("admission_full")
+        token = _new_token("admission_waiting")
+        _guard.admission_waiting += 1
+        if _guard.admission_waiting > _guard.peak_admission_waiting:
+            _guard.peak_admission_waiting = _guard.admission_waiting
+        _guard.admission_queue.append(token)
+        epoch = _guard.epoch
+        deadline = time.monotonic() + _guard.admission_wait_secs
+        try:
+            while True:
+                if _guard.epoch != epoch:
+                    raise LargeImageAdmissionError("cancelled")
+                event = _request_cancel.get()
+                if token.cancelled or (event is not None and event.is_set()) or _host_task_cancelled():
+                    _guard.cancelled += 1
+                    raise LargeImageAdmissionError("cancelled")
+                if _guard.admission_queue and _guard.admission_queue[0] is token:
+                    blocked = _generation_block_reason_locked()
+                    if blocked is None:
+                        _guard.admission_queue.popleft()
+                        _guard.admission_waiting -= 1
+                        _guard.generating += 1
+                        if _guard.generating > _guard.peak_generating:
+                            _guard.peak_generating = _guard.generating
+                        token.state = "generating"
+                        return token
+                    if _guard.admission_wait_secs <= 0:
+                        _reject(blocked)
+                if time.monotonic() >= deadline:
+                    _guard.admission_timed_out += 1
+                    raise LargeImageAdmissionError("admission_timeout")
+                remaining = deadline - time.monotonic()
+                _guard.cv.wait(min(max(remaining, 0.0), 0.2))
+        except BaseException:
+            if _guard.epoch == epoch and token.state == "admission_waiting":
+                _drop_admission_waiter_locked(token)
+                _guard.cv.notify_all()
+            raise
 
 
 def _begin_heavy_waiter() -> Token:
@@ -1006,7 +1601,7 @@ def _begin_heavy_waiter() -> Token:
 def consistency() -> str | None:
     """Return a problem string when counters disagree with token states or caps."""
     with _guard.cv:
-        counts = {"generating": 0, "heavy_waiting": 0, "active": 0}
+        counts = {"generating": 0, "heavy_waiting": 0, "active": 0, "admission_waiting": 0}
         for token in _guard.tokens.values():
             if token.state == "heavy_gate":
                 return "hidden heavy_gate"
@@ -1020,6 +1615,8 @@ def consistency() -> str | None:
             return f"heavy_waiting counter tokens={counts['heavy_waiting']} counter={_guard.heavy_waiting}"
         if counts["active"] != _guard.active:
             return f"active counter tokens={counts['active']} counter={_guard.active}"
+        if counts["admission_waiting"] != _guard.admission_waiting:
+            return "admission_waiting counter"
         for token in _guard.tokens.values():
             if token.state == "done":
                 return "done token retained"
@@ -1034,6 +1631,14 @@ def consistency() -> str | None:
             return "queue length"
         if any(token.state == "generating" for token in _guard.heavy_queue):
             return "generating in queue"
+        if len(_guard.admission_queue) != _guard.admission_waiting:
+            return "admission queue length"
+        if any(token.state != "admission_waiting" for token in _guard.admission_queue):
+            return "admission queue state"
+        if _guard.admission_waiting > _guard.max_admission_waiting:
+            return "admission cap"
+        if _guard.retained_edit_bytes < 0 or _guard.retained_edit_bytes > _guard.max_retained_edit_bytes:
+            return "retained edit bytes"
         if _guard.active > _guard.max_active:
             return "active cap"
         if _guard.heavy_waiting > _guard.max_heavy_waiting:
@@ -1060,6 +1665,9 @@ def bind_large_image_job(size: object) -> Iterator[Token | None]:
         return
     current = _current_token()
     if current is not None and current.state in {"generating", "heavy_waiting", "active"}:
+        # Reusing the parent claim must not skip the cancel check. The claim
+        # itself stays with the outer block; this raise does not drop it.
+        raise_if_request_cancelled()
         yield current
         return
     token = _begin_generation()
@@ -1214,6 +1822,7 @@ def heavy_image_work(
     try:
         token.enter_heavy(stage, _guard.wait_timeout_secs)
         try:
+            raise_if_request_cancelled()
             yield token
         finally:
             token.leave_heavy()
