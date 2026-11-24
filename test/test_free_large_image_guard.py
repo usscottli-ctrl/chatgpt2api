@@ -3740,6 +3740,126 @@ class EditBufferBudgetTests(GuardTestCase):
         self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
         self._assert_drained()
 
+    def test_composite_failure_and_exact_mib_icc_keep_budget_honest(self) -> None:
+        import io
+        import types
+        import zlib
+
+        from PIL import Image, ImageCms
+        from services.protocol.conversation import ImageGenerationError, ImageOutput
+        from services.protocol.openai_v1_image_edit import handle
+
+        def output(req, index, total):
+            return [ImageOutput(
+                kind="result", model=req.model, index=index, total=total,
+                data=[{"b64_json": "b2ZmbGluZQ=="}],
+            )]
+
+        def frames_holding(exc: BaseException, raw_ids: set[int]) -> list[dict]:
+            pending: list[object] = [exc]
+            seen: set[int] = set()
+            found: list[dict] = []
+            while pending:
+                obj = pending.pop()
+                if obj is None or id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                if isinstance(obj, BaseException):
+                    pending.extend([obj.__traceback__, obj.__cause__, obj.__context__])
+                elif isinstance(obj, types.TracebackType):
+                    frame = obj.tb_frame
+                    pending.append(obj.tb_next)
+                    filename = frame.f_code.co_filename
+                    if "services/" not in filename.replace("\\", "/"):
+                        continue
+                    direct = {
+                        key: len(value)
+                        for key, value in frame.f_locals.items()
+                        if id(value) in raw_ids
+                    }
+                    buf = frame.f_locals.get("buf")
+                    open_buf = isinstance(buf, io.BytesIO) and not buf.closed and buf.tell() > 0
+                    if direct or open_buf:
+                        found.append({
+                            "function": frame.f_code.co_name,
+                            "locals": direct,
+                            "open_buf": open_buf,
+                        })
+                    pending.extend(frame.f_locals.values())
+                elif isinstance(obj, dict):
+                    pending.extend(obj.values())
+                elif isinstance(obj, (list, tuple)):
+                    pending.extend(obj)
+            return found
+
+        for n, stream in ((1, False), (4, False), (4, True)):
+            with self.subTest(phase="bad_mask", n=n, stream=stream):
+                reset_for_tests(enabled=True)
+                raw1 = _entropy_png("RGB", 2048, 1024)
+                raw2 = _entropy_png("RGB", 2048, 1024)
+                mask1 = _entropy_png("L", 2048, 1024)
+                raw_ids = {id(raw1), id(raw2), id(mask1)}
+                body = {
+                    "images": [(raw1, "a.png", "image/png"), (raw2, "b.png", "image/png")],
+                    "mask": [(mask1, "m.png", "image/png"), (b"invalid synthetic mask", "bad.png", "image/png")],
+                    "prompt": "offline", "model": "gpt-image-2", "size": "2048x2048",
+                    "n": n, "stream": stream,
+                }
+                del raw1, raw2, mask1
+                saved = None
+                with mock.patch("services.protocol.conversation._generate_single_image_body", output):
+                    try:
+                        result = handle(body)
+                        if stream:
+                            list(result)
+                    except BaseException as exc:
+                        saved = exc
+                self.assertIsNotNone(saved)
+                self.assertEqual(frames_holding(saved, raw_ids), [])
+                self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+                self.assertEqual(body["images"], [])
+                self.assertEqual(body["mask"], [])
+                self._assert_drained()
+
+        amount = 1024 * 1024
+        base = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        profile = amount.to_bytes(4, "big") + base[4:] + os.urandom(amount - len(base))
+        ImageCms.ImageCmsProfile(io.BytesIO(profile))
+        image = Image.frombytes("RGBA", (2048, 1024), os.urandom(2048 * 1024 * 4))
+        stored = io.BytesIO()
+        image.save(stored, format="PNG", icc_profile=profile)
+        image.close()
+        raw = stored.getvalue()
+        mask = _solid_png(2048, 1024)
+        self.assertGreater(len(zlib.compress(profile)), guard.PNG_PROFILE_ACCEPT_BYTES)
+        extra = guard.png_ancillary_upper_bound(raw)
+        cap = guard.output_png_cap(raw)
+        self.assertGreater(extra, 0)
+        self.assertIsNotNone(cap)
+        reset_for_tests(enabled=True)
+        seen = {"actual": 0}
+        from services.protocol import openai_v1_image_edit as edit_module
+
+        original_composite = edit_module._composite_mask
+
+        def watch(images, masks, limits=None):
+            out = original_composite(images, masks, limits)
+            seen["actual"] = guard.payload_byte_length(out)
+            return out
+
+        with mock.patch("services.protocol.openai_v1_image_edit._composite_mask", watch), \
+                mock.patch("services.protocol.conversation._generate_single_image_body", output):
+            handle({
+                "prompt": "offline", "model": "gpt-image-2", "n": 1, "size": "2048x2048",
+                "stream": False,
+                "images": [(raw, "a.png", "image/png")],
+                "mask": [(mask, "m.png", "image/png")],
+            })
+        self.assertGreater(seen["actual"], 0)
+        self.assertLessEqual(seen["actual"], int(cap))
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self._assert_drained()
+
     def test_reservation_is_a_hard_upper_bound(self) -> None:
         guard.configure_limits(max_retained_edit_bytes=1000)
         first = guard.reserve_edit_buffers(600)

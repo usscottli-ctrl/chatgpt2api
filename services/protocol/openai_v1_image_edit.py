@@ -26,13 +26,22 @@ class _CappedBytesIO(BytesIO):
         self._limit = int(limit)
 
     def write(self, data: bytes) -> int:
-        if self.tell() + len(data) > self._limit:
+        incoming = data
+        if self.tell() + len(incoming) > self._limit:
             self.seek(0)
             self.truncate(0)
+            self.close()
+            incoming = None
+            data = None
             from services.free_large_image_guard import LargeImageAdmissionError
 
             raise LargeImageAdmissionError("buffer_budget")
-        return super().write(data)
+        return super().write(incoming)
+
+    def getvalue(self) -> bytes:
+        if self.closed:
+            return b""
+        return super().getvalue()
 
 
 class _EditStream:
@@ -149,42 +158,131 @@ def _composite_mask(
         raise
 
 
+def _close_quiet(obj: object) -> None:
+    closer = getattr(obj, "close", None)
+    if closer is None:
+        return
+    try:
+        closer()
+    except Exception:
+        pass
+
+
 def _composite_mask_into(
     images: list[tuple[bytes, str, str]],
     masks: list[tuple[bytes, str, str]],
     limits: list[int] | None,
     result: list[tuple[bytes, str, str]],
 ) -> list[tuple[bytes, str, str]]:
-    for i, (data, filename, mime_type) in enumerate(images):
-        mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
-        img = Image.open(BytesIO(data)).convert("RGBA")
-        mask_img = Image.open(BytesIO(mask_data))
-        if mask_img.mode == "RGBA":
-            alpha = mask_img.split()[3]
-        elif mask_img.mode == "L":
-            alpha = mask_img
-        else:
-            alpha = mask_img.convert("L")
-        alpha = alpha.resize(img.size, Image.LANCZOS)
-        img.putalpha(alpha)
-        # Pillow's PNG writer copies icc_profile from the image. Dropping it
-        # would change color. The caller reserved ``limits[i]`` for that
-        # profile; the sink cannot grow past the same number.
-        icc = img.info.get("icc_profile") if isinstance(getattr(img, "info", None), dict) else None
-        if limits is not None:
-            buf: BytesIO = _CappedBytesIO(int(limits[i] if i < len(limits) else 0))
-        else:
-            buf = BytesIO()
-        if isinstance(icc, (bytes, bytearray)) and icc:
-            img.save(buf, format="PNG", icc_profile=icc)
-        else:
-            img.save(buf, format="PNG")
-        result.append((buf.getvalue(), filename, "image/png"))
-        for opened in (img, mask_img):
-            closer = getattr(opened, "close", None)
-            if closer is not None:
-                closer()
-    return result
+    """Composite each image. Failure drops this frame's upload and PNG buffer.
+
+    The exception can stay on the caller's traceback. The bytes it must not
+    keep are the source ``data`` local and the writer ``buf``. Those are
+    cleared here, before the exception leaves this frame. ``result`` is the
+    caller's list; the caller clears it when this function raises.
+    """
+    data = None
+    mask_data = None
+    filename = None
+    mime_type = None
+    source = None
+    mask_source = None
+    img = None
+    mask_img = None
+    converted = None
+    alpha = None
+    icc = None
+    buf: BytesIO | None = None
+    payload = None
+    try:
+        for i, (data, filename, mime_type) in enumerate(images):
+            mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
+            source = BytesIO(data)
+            try:
+                img = Image.open(source)
+                loader = getattr(img, "load", None)
+                if loader is not None:
+                    loader()
+                converted = img.convert("RGBA")
+                if converted is not img:
+                    _close_quiet(img)
+                img = converted
+                converted = None
+            finally:
+                source.close()
+                source = None
+            mask_source = BytesIO(mask_data)
+            try:
+                mask_img = Image.open(mask_source)
+                loader = getattr(mask_img, "load", None)
+                if loader is not None:
+                    loader()
+            finally:
+                mask_source.close()
+                mask_source = None
+            if mask_img.mode == "RGBA":
+                alpha = mask_img.split()[3]
+            elif mask_img.mode == "L":
+                alpha = mask_img
+            else:
+                alpha = mask_img.convert("L")
+            alpha = alpha.resize(img.size, Image.LANCZOS)
+            img.putalpha(alpha)
+            # Pillow's PNG writer copies icc_profile. Dropping it would change
+            # color. ``limits[i]`` is the reservation for that profile.
+            info = img.info if isinstance(getattr(img, "info", None), dict) else {}
+            icc = info.get("icc_profile")
+            if limits is not None:
+                buf = _CappedBytesIO(int(limits[i] if i < len(limits) else 0))
+            else:
+                buf = BytesIO()
+            if isinstance(icc, (bytes, bytearray)) and icc:
+                img.save(buf, format="PNG", icc_profile=icc)
+            else:
+                img.save(buf, format="PNG")
+            payload = buf.getvalue()
+            buf.close()
+            buf = None
+            result.append((payload, filename, "image/png"))
+            payload = None
+            icc = None
+            _close_quiet(img)
+            _close_quiet(mask_img)
+            img = None
+            mask_img = None
+            alpha = None
+            data = None
+            mask_data = None
+        return result
+    finally:
+        _close_quiet(buf)
+        buf = None
+        payload = None
+        icc = None
+        _close_quiet(source)
+        _close_quiet(mask_source)
+        source = None
+        mask_source = None
+        _close_quiet(img)
+        _close_quiet(converted)
+        _close_quiet(mask_img)
+        img = None
+        converted = None
+        mask_img = None
+        alpha = None
+        data = None
+        mask_data = None
+        filename = None
+        mime_type = None
+
+
+def _encode_retained(images: list) -> list[str]:
+    """Encode, then drop any source byte local this frame still names."""
+    data = None
+    try:
+        return encode_images(images)
+    finally:
+        data = None
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
@@ -215,6 +313,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         produced = None
         item = None
         part = None
+        profile = None
         try:
             if guard_pixels:
                 with heavy_image_work(discovered_pixels=guard_pixels, stage="edit_input"):
@@ -229,9 +328,11 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
                                     info = opened.info if isinstance(getattr(opened, "info", None), dict) else {}
                                     profile = info.get("icc_profile")
                                     extra = icc_chunk_upper_bound(len(profile)) if isinstance(profile, (bytes, bytearray)) else 0
+                                    profile = None
                                     caps.append(png_rgba_upper_bound(opened.size[0], opened.size[1], extra))
                             item = None
                             part = None
+                            profile = None
                         upper = sum(caps)
                         hold.add(upper)
                         produced = _composite_mask(images, masks, caps)
@@ -255,17 +356,18 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
                         item = None
                         part = None
                         hold.add(encoded_need)
-                    encoded_images = encode_images(images)
+                    encoded_images = _encode_retained(images)
                 raise_if_request_cancelled()
             else:
                 images = _composite_mask(images, masks)
-                encoded_images = encode_images(images)
+                encoded_images = _encode_retained(images)
         finally:
             if isinstance(produced, list):
                 produced.clear()
             produced = None
             item = None
             part = None
+            profile = None
 
     encoded_images = None
     model = str(body.get("model") or "gpt-image-2")

@@ -1259,29 +1259,28 @@ def icc_chunk_upper_bound(profile_len: int) -> int:
 
 
 def png_ancillary_upper_bound(data: bytes) -> int:
-    """Reserve for an iCCP Pillow may copy. Reads chunk lengths only.
+    """Reserve one output iCCP when the source has an iCCP chunk.
 
-    A compressed profile is not inflated here. Any iCCP Pillow can still
-    accept reserves ``PNG_PROFILE_ACCEPT_BYTES`` of output. A larger
-    compressed chunk cannot survive Pillow's reader, so it adds nothing.
+    Chunk headers are read only. The compressed length is not the accept
+    limit: Pillow accepts a decompressed profile of ``PNG_PROFILE_ACCEPT_BYTES``
+    even when zlib stores it slightly larger. One such output profile is
+    reserved, and a profile Pillow will refuse is rejected by Pillow's reader.
     """
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         return 0
     index = 8
-    extra = 0
     while index + 12 <= len(data):
         length = int.from_bytes(data[index:index + 4], "big")
         kind = data[index + 4:index + 8]
         next_index = index + 12 + length
         if length < 0 or next_index > len(data):
             break
-        # keyword is at most 79 bytes, then NUL and the compression method.
-        if kind == b"iCCP" and length <= PNG_PROFILE_ACCEPT_BYTES + 81:
-            extra += icc_chunk_upper_bound(PNG_PROFILE_ACCEPT_BYTES)
+        if kind == b"iCCP":
+            return icc_chunk_upper_bound(PNG_PROFILE_ACCEPT_BYTES)
         if kind == b"IEND":
             break
         index = next_index
-    return extra
+    return 0
 
 
 def _jpeg_geometry_and_icc(data: bytes) -> tuple[tuple[int, int] | None, int]:
