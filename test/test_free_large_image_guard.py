@@ -34,6 +34,31 @@ def _png(width: int, height: int) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + ihdr + b"\x00\x00\x00\x00"
 
 
+def _solid_png(width: int, height: int) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    image = Image.new("RGB", (width, height), (1, 2, 3))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    image.close()
+    return buffer.getvalue()
+
+
+def _entropy_png(mode: str, width: int, height: int) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    channels = len(mode)
+    image = Image.frombytes(mode, (width, height), os.urandom(width * height * channels))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG", compress_level=1)
+    image.close()
+    return buffer.getvalue()
+
+
 class GuardTestCase(unittest.TestCase):
     def setUp(self) -> None:
         os.environ.pop("CHATGPT2API_FREE_LARGE_IMAGE_GUARD", None)
@@ -3168,6 +3193,192 @@ class RealRequestAdmissionTests(GuardTestCase):
 
 class EditBufferBudgetTests(GuardTestCase):
     """Queued edit payloads are bounded by reserved bytes, not by waiter count."""
+
+    def test_large_edit_references_reach_every_body(self) -> None:
+        import httpx
+        import main
+        from services.protocol.conversation import ImageOutput
+
+        image = _solid_png(3840, 2160)
+        encoded = base64.b64encode(image).decode("ascii")
+
+        async def one(n: int, stream: bool):
+            reset_for_tests(enabled=True)
+            seen: list[tuple[int, bool]] = []
+
+            def body(req, index, total):
+                present = list(req.images or [])
+                seen.append((len(present), bool(present) and present[0] == encoded))
+                return [ImageOutput(
+                    kind="result", model=req.model, index=index, total=total,
+                    data=[{"b64_json": "b2ZmbGluZQ=="}],
+                )]
+
+            with mock.patch("api.ai.require_identity", return_value={"id": "offline", "name": "offline", "role": "user"}), \
+                    mock.patch("services.protocol.conversation._generate_single_image_body", body):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://offline.test") as client:
+                    response = await client.post(
+                        "/v1/images/edits",
+                        data={
+                            "model": "gpt-image-2", "prompt": "offline", "size": "2048x2048",
+                            "n": str(n), "stream": "true" if stream else "false",
+                        },
+                        files={"image": ("ref.png", image, "image/png")},
+                    )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertNotIn(b"different Context", response.content)
+            self.assertEqual(seen, [(1, True)] * n)
+            self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+
+        async def all_cases():
+            for n in (1, 4):
+                for stream in (False, True):
+                    await one(n, stream)
+
+        asyncio.run(all_cases())
+        self._assert_drained()
+
+    def test_unstarted_and_early_stream_close_release_the_budget(self) -> None:
+        from services.protocol.openai_v1_image_edit import handle
+
+        image = _solid_png(3840, 2160)
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_retained_edit_bytes=len(image) * 2)
+        for _ in range(2):
+            stream = handle({
+                "prompt": "offline", "model": "gpt-image-2", "n": 4, "size": "2048x2048",
+                "stream": True, "images": [(image, "ref.png", "image/png")], "mask": [],
+            })
+            self.assertEqual(guard.stats()["retained_edit_bytes"], len(image))
+            stream.close()
+            self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        follow = handle({
+            "prompt": "offline", "model": "gpt-image-2", "n": 1, "size": "2048x2048",
+            "stream": True, "images": [(image, "ref.png", "image/png")], "mask": [],
+        })
+        follow.close()
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_retained_edit_bytes=len(image) + guard.base64_payload_length(len(image)))
+        from services.protocol.conversation import ImageOutput
+
+        def body(req, index, total):
+            return [ImageOutput(
+                kind="result", model=req.model, index=index, total=total,
+                data=[{"b64_json": "b2ZmbGluZQ=="}],
+            )]
+
+        with mock.patch("services.protocol.conversation._generate_single_image_body", body):
+            stream = handle({
+                "prompt": "offline", "model": "gpt-image-2", "n": 1, "size": "2048x2048",
+                "stream": True, "images": [(image, "ref.png", "image/png")], "mask": [],
+            })
+            next(stream)
+            stream.close()
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self._assert_drained()
+
+    def test_budget_error_drops_composite_payload_while_exception_remains(self) -> None:
+        import weakref
+
+        from services.protocol.openai_v1_image_edit import handle
+
+        class _Tracked(list):
+            pass
+
+        image = _entropy_png("RGB", 2048, 1024)
+        mask = _entropy_png("L", 2048, 1024)
+        images = _Tracked([(image, "a.png", "image/png")])
+        masks = _Tracked([(mask, "m.png", "image/png")])
+        image_ref = weakref.ref(images)
+        mask_ref = weakref.ref(masks)
+        raw = guard.payload_byte_length(images) + guard.payload_byte_length(masks)
+        upper = guard.composite_output_upper_bound(images)
+        self.assertIsNotNone(upper)
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_retained_edit_bytes=raw + int(upper))
+        produced: list[weakref.ReferenceType] = []
+        original = handle.__globals__["_composite_mask"]
+
+        def composite(*args, **kwargs):
+            out = _Tracked(original(*args, **kwargs))
+            produced.append(weakref.ref(out))
+            return out
+
+        saved = None
+        with mock.patch("services.protocol.openai_v1_image_edit._composite_mask", composite), \
+                mock.patch(
+                    "services.protocol.conversation._generate_single_image_body",
+                    side_effect=AssertionError("upstream"),
+                ):
+            try:
+                handle({
+                    "prompt": "offline", "model": "gpt-image-2", "n": 1, "size": "2048x2048",
+                    "stream": False, "images": images, "mask": masks,
+                })
+            except BaseException as exc:
+                saved = exc
+        self.assertIsNotNone(saved)
+        self.assertEqual(getattr(saved, "code", None), "free_large_image_buffer_budget")
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self.assertEqual(guard.payload_byte_length(image_ref() or []), 0)
+        self.assertEqual(guard.payload_byte_length(mask_ref() or []), 0)
+        self.assertTrue(produced)
+        self.assertEqual(guard.payload_byte_length(produced[0]() or []), 0)
+        self._assert_drained()
+
+    def test_png_upper_bound_holds_for_high_entropy_shapes(self) -> None:
+        from services.protocol.openai_v1_image_edit import _composite_mask
+
+        cases = [
+            ("RGB", 8, 8, "L", 8, 8),
+            ("RGBA", 32, 24, "L", 16, 16),
+            ("L", 64, 40, "L", 64, 40),
+            ("RGB", 2, 85001, "L", 2, 85001),
+            ("RGB", 400, 3, "RGBA", 20, 20),
+        ]
+        for mode, width, height, mask_mode, mask_w, mask_h in cases:
+            with self.subTest(mode=mode, size=(width, height)):
+                image = _entropy_png(mode, width, height)
+                mask = _entropy_png(mask_mode, mask_w, mask_h)
+                upper = guard.composite_output_upper_bound([(image, "a.png", "image/png")])
+                self.assertIsNotNone(upper)
+                produced = _composite_mask(
+                    [(image, "a.png", "image/png")],
+                    [(mask, "m.png", "image/png")],
+                )
+                actual = guard.payload_byte_length(produced)
+                self.assertLessEqual(actual, int(upper))
+                self.assertGreater(actual, 0)
+
+        image = _entropy_png("RGB", 2, 850001)
+        mask = _entropy_png("L", 2, 850001)
+        raw = len(image) + len(mask)
+        upper = int(guard.composite_output_upper_bound([(image, "a.png", "image/png")]) or 0)
+        reset_for_tests(enabled=True)
+        guard.configure_limits(max_retained_edit_bytes=raw + upper - 1)
+        called = {"n": 0}
+
+        def composite(*args, **kwargs):
+            called["n"] += 1
+            return _composite_mask(*args, **kwargs)
+
+        from services.protocol.conversation import ImageGenerationError
+        from services.protocol.openai_v1_image_edit import handle
+
+        with mock.patch("services.protocol.openai_v1_image_edit._composite_mask", composite):
+            with self.assertRaises(ImageGenerationError) as caught:
+                handle({
+                    "prompt": "offline", "model": "gpt-image-2", "n": 1, "size": "2048x2048",
+                    "stream": False,
+                    "images": [(image, "a.png", "image/png")],
+                    "mask": [(mask, "m.png", "image/png")],
+                })
+        self.assertEqual(caught.exception.code, "free_large_image_buffer_budget")
+        self.assertEqual(called["n"], 0)
+        self.assertEqual(guard.stats()["retained_edit_bytes"], 0)
+        self._assert_drained()
 
     def test_reservation_is_a_hard_upper_bound(self) -> None:
         guard.configure_limits(max_retained_edit_bytes=1000)

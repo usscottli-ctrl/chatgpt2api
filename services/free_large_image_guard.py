@@ -1197,29 +1197,46 @@ def base64_payload_length(nbytes: int) -> int:
     return ((nbytes + 2) // 3) * 4
 
 
-def composite_output_upper_bound(images: object) -> int:
-    """Bytes reserved before a mask composite, per image we are about to write.
+def png_rgba_upper_bound(width: int, height: int) -> int:
+    """Worst-case PNG bytes for one RGBA image.
 
-    A known header reserves one RGBA frame plus 64KiB of encoder slack. An
-    unknown header reserves eight times the bytes already held, which is the
-    only size that can be proved before Pillow runs. The caller must drop any
-    output larger than this instead of keeping it.
+    Composite writes RGBA. Each row is a filter byte plus four samples. zlib's
+    stored blocks are the expansion ceiling: a 2-byte header, 5 bytes for
+    every 65535-byte block, and a 4-byte checksum. The chunk wrappers cover
+    the signature, IHDR, one IDAT per stored block, and IEND.
+    """
+    width = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0:
+        return 0
+    rows = height * (1 + width * 4)
+    blocks = (rows + 65534) // 65535
+    zlib_bytes = 2 + rows + blocks * 5 + 4
+    return 8 + 25 + (12 * blocks) + zlib_bytes + 12
+
+
+def composite_output_upper_bound(images: object) -> int | None:
+    """PNG bytes to reserve before a mask composite, or None if a size is unknown.
+
+    Unknown headers are not given a guessed multiple of the compressed length.
+    The caller discovers those dimensions inside the heavy permit and reserves
+    this same bound before saving.
     """
     total = 0
     entries = images if isinstance(images, (list, tuple)) else [images]
+    saw = False
     for item in entries:
         if not item:
             continue
         raw = item[0] if isinstance(item, tuple) else item
         if not isinstance(raw, (bytes, bytearray)):
-            total += 65536
-            continue
+            return None
         size = sniff_image_size(bytes(raw))
-        if size:
-            total += size[0] * size[1] * 4 + 65536
-        else:
-            total += max(len(raw), 1) * 8 + 65536
-    return total
+        if not size:
+            return None
+        saw = True
+        total += png_rgba_upper_bound(size[0], size[1])
+    return total if saw else 0
 
 
 def _host_task_cancelled() -> bool:

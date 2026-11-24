@@ -394,6 +394,7 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    before_upstream: Any = None  # Callable[[ConversationRequest], None] | None
 
 
 @dataclass
@@ -1371,12 +1372,13 @@ def _generate_single_image(
         LargeImageAdmissionError,
         bind_large_image_job,
         raise_if_request_cancelled,
-        run_edit_prepare,
     )
 
     try:
         with bind_large_image_job(request.size):
-            run_edit_prepare()
+            hook = request.before_upstream
+            if hook is not None:
+                hook(request)
             raise_if_request_cancelled()
             return _generate_single_image_body(request, index, total)
     except LargeImageAdmissionError as exc:

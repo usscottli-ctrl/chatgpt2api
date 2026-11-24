@@ -18,6 +18,56 @@ from services.protocol.conversation import (
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
+class _EditStream:
+    """Iterator whose close releases the edit budget even if it never starts.
+
+    A generator's finally does not run when close() happens before the first
+    iteration. This wrapper owns that release, and it does not keep a
+    ContextVar token across yields.
+    """
+
+    def __init__(self, factory, release) -> None:
+        self._factory = factory
+        self._release = release
+        self._gen = None
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        if self._gen is None:
+            self._gen = self._factory()
+        try:
+            return next(self._gen)
+        except StopIteration:
+            self.close()
+            raise
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        gen = self._gen
+        self._gen = None
+        if gen is not None:
+            closer = getattr(gen, "close", None)
+            if closer is not None:
+                try:
+                    closer()
+                except Exception:
+                    pass
+        release = self._release
+        self._release = None
+        if release is not None:
+            release()
+
+
 def _composite_mask(
     images: list[tuple[bytes, str, str]],
     masks: list[tuple[bytes, str, str]],
@@ -56,7 +106,6 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     from services.free_large_image_guard import (
         LargeImageAdmissionError,
         base64_payload_length,
-        bind_edit_prepare,
         bind_large_image_job,
         composite_output_upper_bound,
         edit_input_guard_pixels,
@@ -64,8 +113,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         is_enabled,
         payload_byte_length,
         raise_if_request_cancelled,
+        png_rgba_upper_bound,
         reserve_edit_buffers,
-        reset_edit_prepare,
     )
     from services.protocol.conversation import _admission_error_code
 
@@ -74,36 +123,56 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
 
     def _prepare() -> None:
         nonlocal images, encoded_images
-        if guard_pixels:
-            with heavy_image_work(discovered_pixels=guard_pixels, stage="edit_input"):
-                if masks and hold is not None:
-                    upper = composite_output_upper_bound(images)
-                    hold.add(upper)
-                    produced = _composite_mask(images, masks)
-                    actual = payload_byte_length(produced)
-                    if actual > upper:
+        produced = None
+        item = None
+        part = None
+        try:
+            if guard_pixels:
+                with heavy_image_work(discovered_pixels=guard_pixels, stage="edit_input"):
+                    if masks and hold is not None:
+                        upper = composite_output_upper_bound(images)
+                        if upper is None:
+                            discovered = []
+                            for item in images:
+                                part = item[0] if isinstance(item, tuple) and item else b""
+                                with Image.open(BytesIO(part)) as opened:
+                                    opened.load()
+                                    discovered.append(opened.size)
+                            item = None
+                            part = None
+                            upper = sum(png_rgba_upper_bound(w, h) for w, h in discovered)
+                        hold.add(upper)
+                        produced = _composite_mask(images, masks)
+                        actual = payload_byte_length(produced)
+                        if actual > upper:
+                            produced = None
+                            raise LargeImageAdmissionError("buffer_budget")
+                        hold.release_amount(upper - actual)
+                        images = produced
                         produced = None
-                        raise LargeImageAdmissionError("buffer_budget")
-                    hold.release_amount(upper - actual)
-                    previous = images
-                    images = produced
-                    previous = None
-                    del previous
-                else:
-                    images = _composite_mask(images, masks)
+                    else:
+                        images = _composite_mask(images, masks)
+                    raise_if_request_cancelled()
+                    if hold is not None:
+                        encoded_need = 0
+                        for item in images or []:
+                            part = item[0] if isinstance(item, tuple) and item else b""
+                            if part:
+                                encoded_need += base64_payload_length(len(part))
+                        item = None
+                        part = None
+                        hold.add(encoded_need)
+                    encoded_images = encode_images(images)
                 raise_if_request_cancelled()
-                if hold is not None:
-                    encoded_need = 0
-                    for item in images or []:
-                        raw = item[0] if isinstance(item, tuple) and item else b""
-                        if raw:
-                            encoded_need += base64_payload_length(len(raw))
-                    hold.add(encoded_need)
+            else:
+                images = _composite_mask(images, masks)
                 encoded_images = encode_images(images)
-            raise_if_request_cancelled()
-        else:
-            images = _composite_mask(images, masks)
-            encoded_images = encode_images(images)
+        finally:
+            if isinstance(produced, list):
+                produced.clear()
+            produced = None
+            item = None
+            part = None
 
     encoded_images = None
     model = str(body.get("model") or "gpt-image-2")
@@ -145,9 +214,21 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     # is still waiting does not keep an encoded copy. n=1 non-stream keeps one
     # claim through generation. n>1 and stream encode once inside the first
     # child claim so the parent claim cannot deadlock the children.
+    def _wipe(value: object) -> None:
+        if isinstance(value, list):
+            value.clear()
+
     def _clear_payload() -> None:
-        nonlocal images, encoded_images
+        nonlocal images, encoded_images, masks
+        # Mutate the list objects frames may already point at. Rebinding the
+        # name leaves the previous list reachable from an exception traceback.
+        _wipe(images)
+        _wipe(masks)
+        _wipe(encoded_images)
+        _wipe(body.get("images"))
+        _wipe(body.get("mask"))
         images = []
+        masks = []
         encoded_images = None
         body["images"] = []
         body["mask"] = []
@@ -178,6 +259,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         if hold is not None:
             hold.release()
 
+    handed_off = False
     try:
         if n == 1 and not body.get("stream"):
             with bind_large_image_job("4K"):
@@ -189,39 +271,37 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         gate = threading.Lock()
         state: dict[str, Any] = {"done": False, "error": None}
 
-        def _prepare_once() -> None:
+        def _prepare_once(request: ConversationRequest) -> None:
             with gate:
                 if state["error"] is not None:
                     raise state["error"]
-                if state["done"]:
-                    return
-                try:
-                    _prepare()
-                    state["done"] = True
-                except BaseException as exc:
-                    state["error"] = exc
-                    raise
+                if not state["done"]:
+                    try:
+                        _prepare()
+                        state["done"] = True
+                    except BaseException as exc:
+                        state["error"] = exc
+                        raise
+                request.images = list(encoded_images or [])
+
+        def _outputs():
+            request = _request()
+            request.before_upstream = _prepare_once
+            return stream_image_outputs_with_pool(request)
 
         if body.get("stream"):
-            def _stream():
-                prepare_token = bind_edit_prepare(_prepare_once)
-                try:
-                    yield from stream_image_chunks(stream_image_outputs_with_pool(_request()))
-                finally:
-                    reset_edit_prepare(prepare_token)
-                    _release()
+            def _chunks():
+                yield from stream_image_chunks(_outputs())
 
-            return _stream()
-        prepare_token = bind_edit_prepare(_prepare_once)
-        try:
-            result = _finish(stream_image_outputs_with_pool(_request()))
-        finally:
-            reset_edit_prepare(prepare_token)
+            handed_off = True
+            return _EditStream(_chunks, _release)
+        result = _finish(_outputs())
         if not encoded_images:
             raise ImageGenerationError("image is required")
         return result
     except LargeImageAdmissionError as exc:
+        _clear_payload()
         raise _busy(exc) from exc
     finally:
-        if not body.get("stream"):
+        if not handed_off:
             _release()
